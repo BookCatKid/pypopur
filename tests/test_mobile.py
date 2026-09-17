@@ -756,6 +756,30 @@ class MobileFlowTests(unittest.IsolatedAsyncioTestCase):
             country_code="1",
         )
 
+    async def test_session_storage_round_trip_and_restore(self) -> None:
+        session = MobileSession(
+            sid="stored-sid",
+            ecode="",
+            uid="stored-uid",
+            partner_identity="partner",
+            domain={"mobileApiUrl": "https://api.example.test"},
+            raw_user={"sid": "stored-sid"},
+        )
+        blob = json.loads(json.dumps(session.to_storage()))
+        self.assertEqual(MobileSession.from_storage(blob), session)
+        adopted = self.account.restore_session(blob)
+        self.assertEqual(adopted, session)
+        self.assertEqual(self.account.session, session)
+        self.assertEqual(self.api.api_host, "https://api.example.test")
+        self.assertEqual(self.api.install_id, "install-id")
+        self.assertEqual(self.server.calls, [])
+        self.assertNotIn("stored-sid", repr(adopted))
+
+    def test_session_storage_rejects_missing_sid(self) -> None:
+        with self.assertRaisesRegex(ValueError, "session id"):
+            MobileSession.from_storage({"domain": {}})
+        self.assertIsNone(self.account.session)
+
     async def test_login_exact_two_stage_flow_and_session_redaction(self) -> None:
         session = await self.login()
         self.assertEqual(

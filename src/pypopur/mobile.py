@@ -356,6 +356,35 @@ class MobileSession:
             f"uid={self.uid!r}, partner_identity={self.partner_identity!r})"
         )
 
+    def to_storage(self) -> dict[str, Any]:
+        """Return a JSON-serializable snapshot of this session for persistent storage."""
+
+        return {
+            "sid": self.sid,
+            "ecode": self.ecode,
+            "uid": self.uid,
+            "partner_identity": self.partner_identity,
+            "domain": dict(self.domain),
+            "raw_user": dict(self.raw_user),
+        }
+
+    @classmethod
+    def from_storage(cls, data: Mapping[str, Any]) -> MobileSession:
+        """Rebuild a session from :meth:`to_storage` output."""
+
+        if not isinstance(data, Mapping) or not _optional_text(data.get("sid")):
+            raise ValueError("stored session data is missing a session id")
+        domain = data.get("domain")
+        raw_user = data.get("raw_user")
+        return cls(
+            sid=str(data["sid"]),
+            ecode=None if data.get("ecode") is None else str(data["ecode"]),
+            uid=_optional_text(data.get("uid")),
+            partner_identity=_optional_text(data.get("partner_identity")),
+            domain=domain if isinstance(domain, Mapping) else {},
+            raw_user=dict(raw_user) if isinstance(raw_user, Mapping) else {},
+        )
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class AccountDevice:
@@ -1200,6 +1229,16 @@ class PopurAccount:
     @property
     def session(self) -> MobileSession | None:
         return self.api.session
+
+    def restore_session(self, data: Mapping[str, Any]) -> MobileSession:
+        """Adopt a previously stored session without repeating password login."""
+
+        session = MobileSession.from_storage(data)
+        self.api.session = session
+        mobile_api_url = _optional_text(session.domain.get("mobileApiUrl"))
+        if mobile_api_url:
+            self.api.set_api_host(mobile_api_url)
+        return session
 
     async def _login_token(self, email: str, country_code: str) -> Mapping[str, Any]:
         # Popur App 2 hardcodes country selector ``1`` for its email-login path.  Thing resolves
