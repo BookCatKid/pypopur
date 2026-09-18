@@ -142,9 +142,10 @@ Verified against `02-security.md` / `03-http.md` / `06-auth.md` and the
 native emulator (`popur-research/emu_jni.py`):
 
 - `canonical_sign_input` (sorted `k=v||` whitelist, postData → md5 +
-  4-block swap), `sign_mobile_params` (**nested MD5**
-  `md5hex(md5hex(GLOBAL_S)+canonical)` — emulation-verified, the earlier
-  HMAC-SHA256 inference was wrong), `derive_request_key` (HMAC-SHA256 over
+  4-block swap), `sign_mobile_params` (**HMAC-SHA256**
+  `hmac_sha256(GLOBAL_S, canonical)` — verified by end-to-end cmd-1
+  emulation; the earlier "nested MD5" note had emulated cmd 2's
+  `hmacWrap` helper instead), `derive_request_key` (HMAC-SHA256 over
   master+`_ecode`, hex[:16] ASCII), `encrypt/decrypt_mobile_payload`
   (AES-128-GCM nonce-prepended — `decryptResponseData` verified
   end-to-end under emulation), `mobile_response_signature`
@@ -272,8 +273,10 @@ Resolved since the Phase-1 audit:
   `pypopur.cloud.build_business`/`build_device_api`/`AtopCloudBackend`
   wire a `MobileAppProfile`+`MobileSession` into `Business`.
 - cmd-1 signer **emulation-verified**: `doCommandNative(1, canonical)` =
-  `md5hex(md5hex(GLOBAL_S) + canonical)` (nested MD5 via `hmacWrap`
-  @0x12eb4) — NOT HMAC-SHA256 as first inferred. `getEncryptoKey`
+  `hmac_sha256(GLOBAL_S, canonical)` (64 lowercase hex) — end-to-end
+  cmd-1 emulation after a real cmd-0 derivation (`emu_cmd1.py`); the
+  earlier "nested MD5 via `hmacWrap` @0x12eb4" note had emulated cmd
+  2's helper. `getEncryptoKey`
   NULL-arg1: data = GLOBAL_S alone (`cbz x21` @0x14d18).
   `ThingApiSignManager`/`ThingNetworkSecurity` take bytes GLOBAL_S.
 - Low-power awake binding — `PipelineTransport` auto-constructs

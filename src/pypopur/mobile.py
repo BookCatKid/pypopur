@@ -872,12 +872,11 @@ def canonical_sign_input(params: Mapping[str, str]) -> str:
 
 
 def sign_mobile_params(params: Mapping[str, str], signing_key: bytes) -> str:
-    """Sign a Thing mobile request — ``doCommandNative`` cmd 1 is the nested-MD5
-    ``md5hex(md5hex(master) + canonical)`` (verified by native emulation)."""
+    """Sign a Thing mobile request — ``doCommandNative`` cmd 1 is
+    ``hmac_sha256(master, canonical)`` (verified by native emulation)."""
 
-    inner = hashlib.md5(signing_key, usedforsecurity=False).hexdigest().encode()
-    return hashlib.md5(
-        inner + canonical_sign_input(params).encode(), usedforsecurity=False
+    return hmac.new(
+        signing_key, canonical_sign_input(params).encode(), hashlib.sha256
     ).hexdigest()
 
 

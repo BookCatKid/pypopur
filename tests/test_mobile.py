@@ -709,9 +709,8 @@ class CryptoTests(unittest.TestCase):
             canonical,
             f"a=thing.m.test||postData={swapped}||time=123||v=3.0",
         )
-        inner = hashlib.md5(b"key", usedforsecurity=False).hexdigest()
-        expected = hashlib.md5(
-            inner.encode() + canonical.encode(), usedforsecurity=False
+        expected = hmac.new(
+            b"key", canonical.encode(), hashlib.sha256
         ).hexdigest()
         self.assertEqual(sign_mobile_params(params, b"key"), expected)
         with self.assertRaisesRegex(ValueError, "32-character"):

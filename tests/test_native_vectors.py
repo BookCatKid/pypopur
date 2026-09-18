@@ -20,7 +20,7 @@ from pypopur.mobile import (
     sign_mobile_params,
 )
 from pypopur.popur_app2_material import APP2_CH_KEY, APP2_NATIVE_MASTER_HEX
-from pypopur.sdk.security import ThingNetworkSecurity, default_signer
+from pypopur.sdk.security import ThingNetworkSecurity, default_cmd2, default_signer
 
 GLOBAL_S = bytes.fromhex(APP2_NATIVE_MASTER_HEX)
 
@@ -72,17 +72,34 @@ def test_encrypt_post_data() -> None:
     assert _sec.encrypt_post_data("somekey", b"payload") == b"667f83ac5d2f381f"
 
 
-def test_do_command_native_sign_is_nested_md5() -> None:
-    # hmacWrap @0x12eb4 = digestHex(concat(digestHex(GLOBAL_S), msg)) —
-    # verified by calling the function directly under emulation.
-    assert default_signer("a=1||b=2||postData=abc", GLOBAL_S) == "04d06a31911d159cdae9072cc1d9f135"
+def test_do_command_native_sign_is_hmac_sha256() -> None:
+    # doCommandNative cmd 1 = hmac_sha256(GLOBAL_S, canonical) — verified by
+    # running cmd 1 natively after a real cmd-0 global derivation.
+    assert (
+        default_signer("a=1||b=2||postData=abc", GLOBAL_S)
+        == "5b6be30e5e83ec020442648589b3a077f3416d1be896a86e96f23b0ba2b784ef"
+    )
 
 
-def test_sign_mobile_params_uses_nested_md5() -> None:
+def test_sign_mobile_params_uses_hmac_sha256() -> None:
     params = {"a": "1", "b": "2", "postData": "abc"}
     assert sign_mobile_params(params, GLOBAL_S) == default_signer(
         canonical_sign_input(params), GLOBAL_S
     )
+
+
+@pytest.mark.parametrize(
+    ("ecode", "expected"),
+    [
+        (b"ec00", "deff3b899b64e7e66f33150964d16c5e"),
+        (b"ec01", "e47c139e123a7bc8d84b7339c3fa170f"),
+        (b"", "32730dedaad3c47af867f664cd6534bf"),
+    ],
+)
+def test_do_command_native_cmd2_is_nested_md5(ecode: bytes, expected: str) -> None:
+    # cmd 2 = md5hex(md5hex(GLOBAL_S) + arg) — MQTT password seed,
+    # verified by running cmd 2 natively after a real cmd-0 derivation.
+    assert default_cmd2(ecode, GLOBAL_S) == expected
 
 
 def test_mobile_response_signature_vector() -> None:

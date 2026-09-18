@@ -54,13 +54,14 @@ App-shipped constants (`jadx .../com/smartapp/popur/app/BuildConfig.java`):
 
 - cmd 0 → init runtime globals (above).
 - cmd 1 → sign: input bytes = canonical string; returns **String**
-  `md5hex(md5hex(GLOBAL_S) + canonical)` — nested MD5 via the
-  `hmacWrap` helper @0x12eb4 (`digestHex(concat(digestHex(GLOBAL_S), msg))`).
-  Verified by direct emulation of 0x12eb4 — NOT HMAC-SHA256 (the earlier
-  audit §F inference was wrong; the "HMAC-shaped" code at 0x142d8+ is a
-  different path).
-- cmd 2 → same `hmacWrap` over its byte[] arg (both cmds reach 0x141c8;
-  they differ only in which argument slot is read).
+  `hmac_sha256(GLOBAL_S, canonical)` — 64 lowercase hex. Verified by
+  running cmd 1 end-to-end after a native cmd-0 global derivation
+  (`emu_cmd1.py`; the earlier "nested MD5 via hmacWrap @0x12eb4" note
+  had emulated a helper that belongs to cmd 2's path, not cmd 1's).
+- cmd 2 → `md5hex(md5hex(GLOBAL_S) + arg)` — nested MD5 via the
+  `hmacWrap` helper @0x12eb4, 32 lowercase hex. Used by the MQTT
+  password derivation (`qpqbppd`: ecode bytes → string → centered
+  16 chars). Verified by native emulation (`emu_cmd1.py`).
 - other cmd → null.
 
 ## Java wrappers → native calls

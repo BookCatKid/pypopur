@@ -77,14 +77,13 @@ class TestSecurity:
         # postData swapped in place in the caller's map
         assert params["postData"] == post_data_md5_hex("P")
 
-    def test_default_signer_is_nested_md5(self):
-        # doCommandNative cmd 1 → hmacWrap @0x12eb4 =
-        # md5hex(md5hex(GLOBAL_S) + canonical) — verified by emulation.
+    def test_default_signer_is_hmac_sha256(self):
+        # doCommandNative cmd 1 = hmac_sha256(key, canonical) — verified by
+        # native emulation after a real cmd-0 global derivation.
         canon = "a=x||v=1.0"
-        inner = hashlib.md5(APP_SECRET.encode(), usedforsecurity=False).hexdigest()
         assert (
             default_signer(canon, APP_SECRET)
-            == hashlib.md5(inner.encode() + canon.encode(), usedforsecurity=False).hexdigest()
+            == hmac.new(APP_SECRET.encode(), canon.encode(), hashlib.sha256).hexdigest()
         )
 
     def test_request_key_no_whitelist(self):

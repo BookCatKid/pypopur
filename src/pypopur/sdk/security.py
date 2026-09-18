@@ -16,10 +16,10 @@ globals (``RUNTIME_GLOBAL_S`` etc.); see ``docs/parity/02-security.md`` and
 and the ``getChKey`` output is the constant ``APP2_CH_KEY``.
 
 ``doCommandNative`` cmd 1 (the ``sign`` field) is verified by native
-emulation as nested MD5 — ``md5hex(md5hex(GLOBAL_S) + canonical)`` —
-via the ``hmacWrap`` helper @0x12eb4 (double ``digestHex`` with a
-concat in between). See ``popur-research/emu_jni.py`` /
-``emu_vectors.py`` for the vector harness.
+emulation as HMAC-SHA256 — ``hmac_sha256(GLOBAL_S, canonical)`` — by
+running cmd 1 end-to-end after a native cmd-0 global derivation. See
+``popur-research/emu_jni.py`` / ``emu_cmd0.py`` / ``emu_cmd1.py`` for
+the harness.
 """
 
 from __future__ import annotations
@@ -83,15 +83,24 @@ def post_data_md5_hex(value: str) -> str:
 
 
 def default_signer(canonical: str, key_material: str | bytes) -> str:
-    """``doCommandNative`` cmd 1 — nested MD5 over the canonical string:
-    ``md5hex(md5hex(GLOBAL_S) + canonical)`` (32 lowercase hex). Verified by
-    emulating the cmd-1 path to ``hmacWrap`` @0x12eb4:
-    ``digestHex(concat(digestHex(GLOBAL_S), msg))``. Inject ``signer`` on
-    :class:`ThingApiSignManager` to override."""
+    """``doCommandNative`` cmd 1 — HMAC-SHA256 over the canonical string:
+    ``hmac_sha256(GLOBAL_S, canonical)`` (64 lowercase hex). Verified by
+    emulating cmd 1 end-to-end after a native cmd-0 global derivation.
+    Inject ``signer`` on :class:`ThingApiSignManager` to override."""
+
+    key = key_material if isinstance(key_material, bytes) else key_material.encode()
+    return hmac.new(key, canonical.encode(), hashlib.sha256).hexdigest()
+
+
+def default_cmd2(arg: bytes, key_material: str | bytes) -> str:
+    """``doCommandNative`` cmd 2 — nested MD5 over the raw byte[] arg:
+    ``md5hex(md5hex(GLOBAL_S) + arg)`` (32 lowercase hex). Used by the
+    MQTT password derivation (``qpqbppd``: ecode bytes → centered 16
+    chars). Verified by native emulation (``emu_cmd1.py``)."""
 
     key = key_material if isinstance(key_material, bytes) else key_material.encode()
     inner = hashlib.md5(key, usedforsecurity=False).hexdigest().encode()
-    return hashlib.md5(inner + canonical.encode(), usedforsecurity=False).hexdigest()
+    return hashlib.md5(inner + arg, usedforsecurity=False).hexdigest()
 
 
 class ThingApiSignManager:
