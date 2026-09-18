@@ -33,10 +33,21 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .discovery import DiscoveredS7
 from .dps import decode_snapshot, normalize_dp_mapping
+from .events import DeviceEvent, PopurMqttEvents
 from .exceptions import AuthenticationError, PopurError, ProtocolError, TransportError
 from .local import LocalDeviceConfig
 from .models import DeviceSnapshot
+from .reads import (
+    BizProp,
+    DatapointStat,
+    FirmwareModule,
+    OperateLog,
+    TimerGroup,
+    TimezoneInfo,
+)
 from .reference import S7_PRODUCT_IDS
+from .sdk.dedup import ThingMessageCache
+from .sdk.thing_model import ThingSmartThingModel
 
 POPUR_APP2_PACKAGE_NAME: Final = "com.smartapp.popur.app"
 POPUR_APP2_APP_VERSION: Final = "2.0.0"
@@ -1606,6 +1617,246 @@ class PopurAccount:
         """Decode the complete read-only mobile device record into a snapshot."""
 
         return decode_snapshot(await self.device_dps(device_id, home_id=home_id))
+
+    # -- typed read surface — dbppbbp endpoints, all read-only ----------
+
+    async def thing_model(
+        self, product_id: str, *, product_ver: str | None = None
+    ) -> ThingSmartThingModel:
+        """``ddpdbbp.getThingModelWithPid`` — the semantic schema (property/
+        event/action names, types, ranges) for a product. Empty
+        ``product_ver`` falls back to ``"1.0.0"`` like ``qpppdbb``, and the
+        parsed model is put into ``ThingModelCache`` exactly as the app's
+        ``ddpdbbp$pbddddb`` listener does."""
+
+        from .sdk.thing_model import DEFAULT_PRODUCT_VER, ThingModelCache
+
+        result = await self.api.request(
+            "thing.m.product.thing.model",
+            "1.0",
+            {
+                "productId": product_id,
+                "productVersion": product_ver or DEFAULT_PRODUCT_VER,
+            },
+        )
+        model = ThingSmartThingModel.from_json(_require_mapping(result, "thing model"))
+        ThingModelCache.instance().put(model)
+        return model
+
+    async def device_events(
+        self,
+        device_id: str,
+        *,
+        dp_ids: str | Sequence[int] = "",
+        offset: int = 0,
+        limit: int = 20,
+        start_time: str = "",
+        end_time: str = "",
+        sort_type: str = "DESC",
+        home_id: int | str | None = None,
+    ) -> OperateLog:
+        """``thing.m.smart.operate.all.log`` — the DP report history page.
+
+        ``dp_ids`` accepts a comma-separated string or an int sequence
+        (``"1,2"`` / ``[1, 2]``); the service rejects an empty ``dpIds``
+        with ``PARAMS_ILLEGAL``. The SDK request sets
+        ``setSessionRequire(true)`` and ``setSpRequest(true)`` — the
+        ``sp=1`` URL param is required, which is why this goes through
+        ``url_params``. Returns the ``{dps, dpc, hasNext, total}`` page."""
+
+        dp_ids_str = (
+            dp_ids
+            if isinstance(dp_ids, str)
+            else ",".join(str(dp) for dp in dp_ids)
+        )
+        result = await self.api.request(
+            "thing.m.smart.operate.all.log",
+            "1.0",
+            {
+                "devId": device_id,
+                "dpIds": dp_ids_str,
+                "offset": offset,
+                "limit": limit,
+                "startTime": start_time,
+                "endTime": end_time,
+                "sortType": sort_type,
+            },
+            gid=home_id,
+            url_params={"sp": "1"},
+        )
+        if result is None:
+            return OperateLog((), (), False, None)
+        return OperateLog.from_json(_require_mapping(result, "operate log"))
+
+    async def firmware_info(
+        self, device_id: str, *, home_id: int | str | None = None
+    ) -> tuple[FirmwareModule, ...]:
+        """``thing.m.device.upgrade.info`` — per-module firmware versions
+        and OTA status."""
+
+        result = await self.api.request(
+            "thing.m.device.upgrade.info", "1.0", {"devId": device_id}, gid=home_id
+        )
+        if result is None:
+            return ()
+        if not isinstance(result, list):
+            raise ProtocolError("upgrade info response was not an array")
+        return tuple(
+            FirmwareModule.from_json(_require_mapping(item, "firmware module"))
+            for item in result
+        )
+
+    async def device_meta(
+        self, device_id: str, *, home_id: int | str | None = None
+    ) -> Mapping[str, Any]:
+        """``thing.m.device.meta.get`` — SDK/BT/MQTT capability map."""
+
+        result = await self.api.request(
+            "thing.m.device.meta.get", "1.0", {"devId": device_id}, gid=home_id
+        )
+        return _require_mapping(result, "device meta")
+
+    async def biz_props(
+        self, device_id: str, *, home_id: int | str | None = None
+    ) -> tuple[BizProp, ...]:
+        """``thing.m.device.biz.prop.list`` — device business-property
+        flags (OTA state, BT capability, …)."""
+
+        result = await self.api.request(
+            "thing.m.device.biz.prop.list", "1.0", {"devId": device_id}, gid=home_id
+        )
+        if result is None:
+            return ()
+        if not isinstance(result, list):
+            raise ProtocolError("biz prop response was not an array")
+        return tuple(
+            BizProp.from_json(_require_mapping(item, "biz prop")) for item in result
+        )
+
+    async def device_timezone(self, device_id: str, *, lastest_years: int = 3) -> TimezoneInfo:
+        """``thing.m.device.timezone.get`` — timezone plus DST schedule."""
+
+        result = await self.api.request(
+            "thing.m.device.timezone.get",
+            "1.0",
+            {"gwId": device_id, "lastestYears": lastest_years},
+        )
+        return TimezoneInfo.from_json(_require_mapping(result, "timezone"))
+
+    async def timers(
+        self, device_id: str, *, home_id: int | str | None = None
+    ) -> tuple[TimerGroup, ...]:
+        """``thing.m.timer.all.list`` — scheduled timers grouped by
+        category (empty when the device has none)."""
+
+        result = await self.api.request(
+            "thing.m.timer.all.list", "1.0", {"devId": device_id}, gid=home_id
+        )
+        if result is None:
+            return ()
+        if not isinstance(result, list):
+            raise ProtocolError("timer list response was not an array")
+        return tuple(
+            TimerGroup.from_json(_require_mapping(item, "timer group"))
+            for item in result
+        )
+
+    async def datapoint_stats(
+        self,
+        device_id: str,
+        *,
+        dp_id: int,
+        period: str = "day",
+        stat_type: str = "sum",
+        year: str = "",
+        month: str = "",
+        day: str = "",
+        hour: str = "",
+        number: int = 30,
+    ) -> DatapointStat:
+        """``m.smart.datapoint.stat`` — aggregated DP statistics.
+
+        ``period`` is the ``DataPointTypeEnum`` wire value
+        (``"day"``/``"week"``/``"month"``); ``stat_type`` is the
+        aggregation (``"sum"``/``"avg"``/``"max"``/``"min"``/``"count"``)."""
+
+        result = await self.api.request(
+            "m.smart.datapoint.stat",
+            "1.0",
+            {
+                "gwId": device_id,
+                "devId": device_id,
+                "type": period,
+                "year": year,
+                "month": month,
+                "day": day,
+                "hour": hour,
+                "number": number,
+                "dpId": dp_id,
+                "statType": stat_type,
+            },
+        )
+        return DatapointStat.from_json(_require_mapping(result, "datapoint stat"))
+
+    async def datapoint_stat_rank(
+        self, device_id: str, *, dp_id: int, day: str
+    ) -> str | None:
+        """``m.smart.datapoint.stat.oneday`` — the day's rank string
+        (``day`` as ``YYYYMMDD``; the app always passes
+        ``statType="rank"``)."""
+
+        result = await self.api.request(
+            "m.smart.datapoint.stat.oneday",
+            "1.0",
+            {
+                "gwId": device_id,
+                "devId": device_id,
+                "dpId": dp_id,
+                "day": day,
+                "statType": "rank",
+            },
+        )
+        return None if result is None else str(result)
+
+    def connect_events(
+        self,
+        *,
+        devices: Mapping[str, str] | None = None,
+        install_id: str | None = None,
+        on_event: Callable[[DeviceEvent], None] | None = None,
+        on_error: Callable[[str, str, str], None] | None = None,
+        dedup: ThingMessageCache | None = None,
+        sock_factory: Callable | None = None,
+        tls_context: Any = None,
+        dp_sink: Callable[[DeviceEvent], None] | None = None,
+    ) -> PopurMqttEvents:
+        """Build the app's real-time channel from this session.
+
+        ``devices`` maps ``devId → localKey`` for every device whose
+        ``smart/mb/in/{devId}`` pushes should decode — without a key the
+        binary frames drop silently exactly like an unknown devId in the
+        app. ``install_id`` defaults to the API's deviceId (the value the
+        app passes to ``initMqttConfig``). ``dp_sink`` receives each decoded
+        event before ``on_event`` — pass
+        ``events.make_central_ingest_sink(CentralDpIngest(...), schemas)``
+        to merge pushes into the device cache exactly like the app."""
+
+        if self.api.session is None:
+            raise MobileApiError(
+                "USER_SESSION_LOSS", "no active session", action="mqtt.connect"
+            )
+        return PopurMqttEvents(
+            self.api.profile,
+            self.api.session,
+            install_id or self.api.install_id,
+            devices=devices,
+            on_event=on_event,
+            on_error=on_error,
+            dedup=dedup,
+            sock_factory=sock_factory,
+            tls_context=tls_context,
+            dp_sink=dp_sink,
+        )
 
     async def local_keys(
         self, gateway_id: str, *, node_ids: Sequence[str] | None = None

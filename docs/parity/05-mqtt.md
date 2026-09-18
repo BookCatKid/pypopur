@@ -353,6 +353,30 @@ Topic prefix order:
        else log only
    - (loop continues over remaining suffixes — one cb call per match)
 
+### Device listener — `qqpqqpq` (sdk/device)
+
+The app's concrete `MqttMessageRespParseListener` for device topics:
+
+- `getTopicSuffix()` (461-490) = `{"smart/mb/in/", "m/dg/",
+  bdpdqbp()}` — the third element is the user-topic helper
+  (`partnerIdentity + "/mb/" + uid`), not a pv version.
+- `getLocalKey(topic)` (300-459): strips `smart/mb/in/` or
+  `smart/mb/out/` → devId → `DevListCache.getDevRespBean(devId)
+  .getLocalKey()`; BlueMesh/SigMesh localKey fallback when the bean is
+  absent; null when neither resolves.
+- `isDataUpdated(topic, s, o)` (492-…): strips `smart/mb/in/` then
+  `m/dg/` → devId → `qdddqdp.isDataUpdated(devId, s, o)` — the same
+  5000 ms dedup store as LAN inbound.
+
+Ported → `pypopur.events.DeviceEventListener` +
+`pypopur.events.PopurMqttEvents` (session → credentials → TLS wire
+client → subscriptions → `dispatch_inbound_message` → `DeviceEvent`
+callbacks), `pypopur.events.build_mqtt_credentials` (the
+`UserConfigSessionLogoutManager$6` config: `token` = sid, `appTag` =
+`"os"`), and `pypopur.events.make_central_ingest_sink` which routes
+decoded DP pushes through `CentralDpIngest.ingest` (`from_cloud=true`)
+so MQTT updates merge into `DevListCacheManager` exactly like the app.
+
 ### Inbound decoders
 
 **`dbpdpbp` (2.3)**: layout `pv3 || s(4B@3) || o(4B@7) || flag(1B@11)
@@ -903,9 +927,10 @@ Ported → `pypopur.sdk.mqtt_session` (`MqttServerManager`,
   semantics, delivery callbacks) — only skimmed
 - `pqdqqbd.pdqppqb().bppdpdq()` pre-connect hook
 - MQTT-side dedup uses the same `qdddqdp` store semantics documented
-  above (5000 ms window, remove-on-hit, `o==0` bypass); confirm the
-  `qbqddpp` decoders' `isDataUpdated` entry point shares the same
-  listener chain
+  above (5000 ms window, remove-on-hit, `o==0` bypass) — confirmed:
+  `qbqddpp` calls the listener's `isDataUpdated(topic, s, o)` and
+  `qqpqqpq` forwards it to `qdddqdp.isDataUpdated(devId, s, o)` after
+  stripping the topic prefix
 - Whether `publishDevice` actually uses builder `t` (int, default -1)
   vs a fresh timestamp — `bbppbbd` sets `T=(int)System.currentTimeMillis`
   — confirm which int is the millis value vs seconds

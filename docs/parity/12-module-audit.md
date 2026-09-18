@@ -21,8 +21,10 @@ neutral), **fix** (right shape, wrong/incomplete semantics), **rewrite**
 | `discovery.py` | done | rewritten on `sdk/discovery.py` + real UDP socket stack |
 | `local.py` | done | rewritten on real 0x55aa/session-key `sdk/lan_*` stack |
 | `cloud.py` | done | `CloudChannelBackend`: MQTT-first / HTTP-fallback / 10203 |
-| `mobile.py` | done | crypto/sign/login verified; batch bootstrap + retry/session/region added |
+| `mobile.py` | done | crypto/sign/login verified; batch bootstrap + retry/session/region added; typed read surface (`thing_model`, `device_events`, `firmware_info`, `device_meta`, `biz_props`, `device_timezone`, `timers`, `datapoint_stats`, `datapoint_stat_rank`) + `connect_events` |
 | `pipeline.py` | done | `PipelineTransport` composing LAN + cloud via `ThingDevicePresenter` |
+| `events.py` | done | session→MQTT construction (`getMqttConfigInfo` token=sid, appTag="os"), `qqpqqpq` listener (topic suffixes, getLocalKey/isDataUpdated prefix strip), `CentralDpIngest` bridge |
+| `reads.py` | done | typed beans for `dbppbbp` read endpoints (operate log, upgrade info, timezone, timers, biz props, datapoint stats) |
 | `__init__.py` | done | re-exports updated during rebuild |
 
 ## Per-module detail
@@ -163,7 +165,10 @@ native emulator (`popur-research/emu_jni.py`):
   resync, session-loss remap (105), `handleApiError` requeue policy, and
   `ApiUrlProvider` region routing — ported from `Business`.
 - MQTT session in `sdk/mqtt_session.py` (`qpqbppd` OEM creds) + real wire
-  client in `sdk/mqtt_client.py`.
+  client in `sdk/mqtt_client.py`; session→connection construction,
+  `qqpqqpq` listener semantics and the `CentralDpIngest` bridge live in
+  `events.py` (`PopurMqttEvents`, `DeviceEventListener`,
+  `make_central_ingest_sink`), reachable via `PopurAccount.connect_events`.
 
 ## Architecture gaps (no module exists) — resolved
 
