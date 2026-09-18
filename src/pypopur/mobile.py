@@ -1114,6 +1114,7 @@ class ThingMobileApi:
         encrypted: bool | None = None,
         gid: int | str | None = None,
         region: str | None = None,
+        url_params: Mapping[str, Any] | None = None,
     ) -> Any:
         """Execute one mobile ATOP request and return its decoded result.
 
@@ -1123,6 +1124,10 @@ class ThingMobileApi:
         timestamp and retries exactly once with a fresh requestId;
         ``USER_SESSION_INVALID``/``USER_SESSION_LOSS`` fire the session-loss
         seam and surface as errorCode ``"105"``.
+
+        ``url_params`` is the ``ThingApiParams.putUrlParams`` channel — extra
+        wire-level params merged before signing (e.g. ``{"sp": "1"}`` for
+        ``setSpRequest`` endpoints, ``isH5``/``h5Token``/``n4h5``/``lat``/``lon``).
         """
 
         session = self.session if session_required else None
@@ -1145,6 +1150,7 @@ class ThingMobileApi:
                     encrypted=encrypted,
                     gid=gid,
                     region=region,
+                    url_params=url_params,
                 )
             except MobileApiError as err:
                 if (
@@ -1174,6 +1180,7 @@ class ThingMobileApi:
         encrypted: bool,
         gid: int | str | None,
         region: str | None,
+        url_params: Mapping[str, Any] | None = None,
     ) -> Any:
         request_id = str(self._uuid_factory())
         # ThingApiParams.checkAPIName() rewrites "thing.*" API names to the legacy "smartlife.*"
@@ -1187,6 +1194,8 @@ class ThingMobileApi:
             sid=session.sid if session else None,
             gid=gid,
         )
+        if url_params:
+            params.update({str(key): str(value) for key, value in url_params.items()})
         # ThingApiParams.hasPostData() checks whether the JSONObject exists, not whether it has
         # entries. Preserve the Java distinction between no postData (None) and an explicit empty
         # object ({}), because the latter is still encrypted and included in the request/signature.
