@@ -83,10 +83,20 @@ _SIGN_FIELDS: Final = frozenset(
 class MobileApiError(PopurError):
     """The Thing mobile API returned an application-level error."""
 
-    def __init__(self, code: str | None, message: str | None, *, action: str) -> None:
+    def __init__(
+        self,
+        code: str | None,
+        message: str | None,
+        *,
+        action: str,
+        server_timestamp: float | None = None,
+    ) -> None:
         self.code = code or "UNKNOWN"
         self.message = message or "Unknown mobile API error"
         self.action = action
+        # ``BusinessResponse.getTimestamp()`` — drives TimeStampManager resync on
+        # TIME_VALIDATE_FAILED.
+        self.server_timestamp = server_timestamp
         super().__init__(f"{action}: {self.code}: {self.message}")
 
 
@@ -127,6 +137,8 @@ class MobileAppProfile:
     brand: str | None = None
     biz_data: Mapping[str, Any] = field(default_factory=lambda: {"customDomainSupport": "1"})
     extra_params: Mapping[str, str] = field(default_factory=dict)
+    # ``IApiUrlProvider`` country→host table for per-request region overrides.
+    region_hosts: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("api_host", "client_id", "app_version", "sdk_version", "ttid", "ch_key"):
@@ -256,6 +268,7 @@ class MobileAppProfile:
             transformed_security_component=transformed_security_component,
             app_secret=app_secret,
             neutral_domain=True,
+            region_hosts=POPUR_APP2_REGION_HOSTS,
             **kwargs,
         )
 
@@ -286,6 +299,7 @@ class MobileAppProfile:
             encryption_secret=master,
             package_name=POPUR_APP2_PACKAGE_NAME,
             neutral_domain=True,
+            region_hosts=POPUR_APP2_REGION_HOSTS,
             **kwargs,
         )
 
@@ -858,9 +872,13 @@ def canonical_sign_input(params: Mapping[str, str]) -> str:
 
 
 def sign_mobile_params(params: Mapping[str, str], signing_key: bytes) -> str:
-    """Sign a Thing mobile request using the App-2 native HMAC-SHA256 primitive."""
+    """Sign a Thing mobile request — ``doCommandNative`` cmd 1 is the nested-MD5
+    ``md5hex(md5hex(master) + canonical)`` (verified by native emulation)."""
 
-    return hmac.new(signing_key, canonical_sign_input(params).encode(), hashlib.sha256).hexdigest()
+    inner = hashlib.md5(signing_key, usedforsecurity=False).hexdigest().encode()
+    return hashlib.md5(
+        inner + canonical_sign_input(params).encode(), usedforsecurity=False
+    ).hexdigest()
 
 
 def mobile_response_signature(result: str, timestamp: int | str, request_key: bytes) -> str:
@@ -980,6 +998,7 @@ class ThingMobileApi:
         *,
         install_id: str | None = None,
         timeout: float = 10.0,
+        on_session_invalid: Callable[[MobileApiError], None] | None = None,
         _post_form: FormPoster | None = None,
         _clock: Callable[[], float] = time.time,
         _uuid_factory: Callable[[], uuid.UUID] = uuid.uuid4,
@@ -997,15 +1016,27 @@ class ThingMobileApi:
         self._post_form = _post_form or _stdlib_post_form
         self._clock = _clock
         self._uuid_factory = _uuid_factory
+        # ``Business.handler`` session-loss broadcast seam — invoked when the server answers
+        # USER_SESSION_INVALID/USER_SESSION_LOSS before the error reaches the caller as "105".
+        self.on_session_invalid = on_session_invalid
+        # ``TimeStampManager`` offset: server ``t`` − local clock, applied to ``time`` params.
+        self._time_offset = 0.0
 
-    @property
-    def endpoint(self) -> str:
-        host = self._api_host.rstrip("/")
+    def _endpoint_for(self, region: str | None) -> str:
+        """``getApiUrl``/``getApiUrlByCountryCode`` — per-request host resolution."""
+        host = self._api_host
+        if region is not None:
+            host = self.profile.region_hosts.get(region.strip().lower(), host)
+        host = host.rstrip("/")
         if host.endswith("/api.json"):
             return host
         if host.startswith(("http://", "https://")):
             return f"{host}/api.json"
         return f"https://{host}/api.json"
+
+    @property
+    def endpoint(self) -> str:
+        return self._endpoint_for(None)
 
     @property
     def api_host(self) -> str:
@@ -1043,7 +1074,8 @@ class ThingMobileApi:
             "chKey": self.profile.ch_key,
             "channel": self.profile.channel,
             "et": "3" if encrypted else "0.0.1",
-            "time": str(int(self._clock())),
+            # ``TimeStampManager.getCurrentTimeStamp`` — server-synced clock.
+            "time": str(int(self._clock() + self._time_offset)),
             "requestId": request_id,
         }
         if self.profile.device_core_version:
@@ -1082,13 +1114,68 @@ class ThingMobileApi:
         session_required: bool = True,
         encrypted: bool | None = None,
         gid: int | str | None = None,
+        region: str | None = None,
     ) -> Any:
-        """Execute one mobile ATOP request and return its decoded result."""
+        """Execute one mobile ATOP request and return its decoded result.
+
+        Mirrors ``Business$RequestTask``: ``checkApiParams`` fails a
+        session-required request locally with ``USER_SESSION_LOSS`` when no
+        session exists; a server ``TIME_VALIDATE_FAILED`` response syncs the
+        timestamp and retries exactly once with a fresh requestId;
+        ``USER_SESSION_INVALID``/``USER_SESSION_LOSS`` fire the session-loss
+        seam and surface as errorCode ``"105"``.
+        """
 
         session = self.session if session_required else None
         if session_required and session is None:
-            raise MobileAuthenticationError("Thing mobile API request requires a login session")
+            # checkApiParams — synthetic failure, no request leaves the client.
+            raise MobileApiError(
+                "USER_SESSION_LOSS",
+                "Session is not exist and need login again",
+                action=action,
+            )
         encrypted = session_required if encrypted is None else encrypted
+        retry_mode = False
+        while True:
+            try:
+                return await self._request_once(
+                    action,
+                    version,
+                    post_data,
+                    session=session,
+                    encrypted=encrypted,
+                    gid=gid,
+                    region=region,
+                )
+            except MobileApiError as err:
+                if (
+                    not retry_mode
+                    and err.code == "TIME_VALIDATE_FAILED"
+                    and err.server_timestamp is not None
+                ):
+                    # onSuccessResponseWithResultFailure → onRetry: retryTime 1→0
+                    # permits exactly one re-request with a fresh requestId.
+                    self._time_offset = err.server_timestamp - self._clock()
+                    retry_mode = True
+                    continue
+                if err.code in ("USER_SESSION_INVALID", "USER_SESSION_LOSS"):
+                    # Business.handler session-loss broadcast, then errorCode→"105".
+                    if self.on_session_invalid is not None:
+                        self.on_session_invalid(err)
+                    raise MobileApiError("105", err.message, action=action) from err
+                raise
+
+    async def _request_once(
+        self,
+        action: str,
+        version: str,
+        post_data: Mapping[str, Any] | None,
+        *,
+        session: MobileSession | None,
+        encrypted: bool,
+        gid: int | str | None,
+        region: str | None,
+    ) -> Any:
         request_id = str(self._uuid_factory())
         # ThingApiParams.checkAPIName() rewrites "thing.*" API names to the legacy "smartlife.*"
         # namespace before they reach the wire; the server only accepts the rewritten form.
@@ -1132,7 +1219,7 @@ class ThingMobileApi:
             "x-client-trace-id": request_id,
         }
         status, headers, raw = await self._post_form(
-            self.endpoint, params, request_headers, self.timeout
+            self._endpoint_for(region), params, request_headers, self.timeout
         )
         if not 200 <= status < 300:
             raise TransportError(f"Thing mobile API returned HTTP {status} for {action}")
@@ -1147,6 +1234,7 @@ class ThingMobileApi:
                 _optional_text(envelope.get("errorCode")),
                 _optional_text(envelope.get("errorMsg")),
                 action=action,
+                server_timestamp=_numeric(envelope.get("t")),
             )
         result: Any = envelope.get("result")
         if encrypted:
@@ -1176,9 +1264,68 @@ class ThingMobileApi:
                         _optional_text(result.get("errorCode")),
                         _optional_text(result.get("errorMsg")),
                         action=action,
+                        server_timestamp=_numeric(result.get("t")),
                     )
                 result = result.get("result")
         return result
+
+    def _build_api_bean(
+        self,
+        action: str,
+        version: str,
+        post_data: Mapping[str, Any] | None,
+        *,
+        session: MobileSession | None,
+    ) -> dict[str, Any]:
+        """``ApiBean(ThingApiParams)`` — a fully-signed sub-request for batching.
+
+        The bean carries ``a``/``v``/``et``/``requestId``/``t`` plus ``params``
+        (the et-3 encrypted postData string from ``getRequestBody``) and
+        ``sign`` computed over urlParams ⊕ requestBody ⊕ ``time``, exactly as
+        ``ApiBean.initSign`` does.
+        """
+
+        request_id = str(self._uuid_factory())
+        wire_action = "smartlife" + action[len("thing") :] if action.startswith("thing") else action
+        params = self._base_params(
+            action=wire_action,
+            version=version,
+            request_id=request_id,
+            encrypted=True,
+            sid=session.sid if session else None,
+            gid=None,
+        )
+        request_key = derive_request_key(
+            request_id,
+            self.profile.encryption_secret,
+            session.ecode if session else None,
+        )
+        plain_post = _compact_json(post_data if post_data is not None else {})
+        params["postData"] = encrypt_mobile_payload(plain_post, request_key)
+        timestamp = int(self._clock() + self._time_offset)
+        params["time"] = str(timestamp)
+        return {
+            "a": wire_action,
+            "v": version,
+            "et": params["et"],
+            "requestId": request_id,
+            "sign": sign_mobile_params(params, self.profile.signing_key),
+            "t": timestamp,
+            "params": params["postData"],
+        }
+
+
+def _numeric(value: Any) -> int | float | None:
+    """Extract the response ``t`` timestamp when present."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _optional_text(value: Any) -> str | None:
@@ -1329,6 +1476,94 @@ class PopurAccount:
     async def home_devices(self, home_id: int | str) -> tuple[AccountDevice, ...]:
         result = await self.api.request("m.life.my.group.device.list", "2.2", {"gid": home_id})
         return _parse_device_list(result, "home device list")
+
+    async def batch_invoke(
+        self,
+        apis: Sequence[tuple[str, str, Mapping[str, Any] | None]],
+        *,
+        gid: int | str | None = None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """``thing.m.api.batch.invoke`` v1.0 — a list of signed ``ApiBean``s.
+
+        ``apis`` items are ``(api_name, version, postData)``; each becomes a
+        fully-signed sub-request exactly as ``ApiBean.initSign`` produces.
+        Returns the ``ApiResponeBean`` list (each a ``BusinessResponse`` shape
+        with an extra ``a`` api-name field).
+        """
+
+        beans = [
+            self.api._build_api_bean(action, version, post, session=self.api.session)
+            for action, version, post in apis
+        ]
+        post_data: dict[str, Any] = {"apis": beans}
+        if gid is not None:
+            post_data["gid"] = gid
+        result = await self.api.request("thing.m.api.batch.invoke", "1.0", post_data, gid=gid)
+        if result is None:
+            return ()
+        if not isinstance(result, list) or not all(isinstance(item, Mapping) for item in result):
+            raise ProtocolError("batch invoke response was not an array of objects")
+        return tuple(dict(item) for item in result)
+
+    async def fetch_home(
+        self,
+        home_id: int | str,
+        *,
+        mqtt_subscribe: Callable[[str], Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """``OooOOO.OooO0O0(gid)`` — the app's home-detail bootstrap.
+
+        Subscribes ``m/ug/<gid>`` (when a subscribe seam is supplied), fires
+        the 8-API ``thing.m.api.batch.invoke`` batch plus the parallel
+        ``m.life.app.smart.local.device.list`` call, and returns the raw
+        ``{api_name: result}`` map — the ``ThingListDataBean`` merge inputs.
+        """
+
+        gid = int(home_id)
+        if mqtt_subscribe is not None:
+            maybe = mqtt_subscribe(f"m/ug/{gid}")
+            if asyncio.iscoroutine(maybe) or isinstance(maybe, asyncio.Future):
+                await maybe
+        # ``o00oO0o.OooO00o`` — the 8 ApiBeans in wire order.
+        batch, local = await asyncio.gather(
+            self.batch_invoke(
+                (
+                    ("m.life.my.group.device.sort.list", "2.1", {"gid": str(gid)}),
+                    ("m.life.my.group.device.list", "2.2", {"gid": gid}),
+                    ("m.life.my.group.mesh.list", "3.1", {"gid": gid}),
+                    ("m.life.my.group.device.group.list", "4.3", {"gid": gid}),
+                    ("m.life.location.get", "3.4", {"gid": gid}),
+                    (
+                        "m.life.device.ref.info.my.list",
+                        "7.2",
+                        {"gid": gid, "zigbeeGroup": True},
+                    ),
+                    ("thing.m.my.shared.device.list", "3.2", {}),
+                    ("thing.m.my.shared.device.group.list", "3.0", {}),
+                ),
+                gid=gid,
+            ),
+            # ``o0OOO0o`` — ``m.life.app.smart.local.device.list`` v1.1.
+            self.api.request(
+                "m.life.app.smart.local.device.list",
+                "1.1",
+                {"homeId": gid, "groupType": "homeGroup"},
+            ),
+        )
+        merged: dict[str, Any] = {
+            "m.life.app.smart.local.device.list": local,
+        }
+        for item in batch:
+            api_name = item.get("a") or item.get("api")
+            if api_name is None:
+                continue
+            # ``ApiResponeBean.getApi`` — @xx2@smartlife→thing un-rewrite.
+            merged[
+                "thing" + str(api_name)[len("smartlife") :]
+                if str(api_name).startswith("smartlife")
+                else str(api_name)
+            ] = item.get("result")
+        return merged
 
     async def device_detail(
         self, device_id: str, *, home_id: int | str | None = None

@@ -205,6 +205,7 @@ def make_profile() -> MobileAppProfile:
         signing_key=b"s" * 32,
         encryption_secret=b"synthetic-master-secret",
         package_name="com.example.popur-test",
+        region_hosts={"us": "https://example.invalid", "eu": "https://a1.tuyaeu.com"},
     )
 
 
@@ -224,6 +225,7 @@ class SyntheticThingServer:
         self.home_list_result: Any = [{"homeId": 7, "name": "Home"}]
         self.key_result: Any | None = None
         self.error_by_action: dict[str, tuple[str, str]] = {}
+        self.error_once_by_action: dict[str, tuple[str, str]] = {}
         self.http_status_by_action: dict[str, int] = {}
         self.invalid_json_action: str | None = None
         self.compress_action: str | None = None
@@ -300,12 +302,33 @@ class SyntheticThingServer:
         status = self.http_status_by_action.get(action, 200)
         if status != 200:
             return status, {}, b"{}"
+        if action in self.error_once_by_action:
+            code, message = self.error_once_by_action.pop(action)
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "success": False,
+                        "errorCode": code,
+                        "errorMsg": message,
+                        "t": 1_700_000_500,
+                    }
+                ).encode(),
+            )
         if action in self.error_by_action:
             code, message = self.error_by_action[action]
             return (
                 200,
                 {},
-                json.dumps({"success": False, "errorCode": code, "errorMsg": message}).encode(),
+                json.dumps(
+                    {
+                        "success": False,
+                        "errorCode": code,
+                        "errorMsg": message,
+                        "t": 1_700_000_500,
+                    }
+                ).encode(),
             )
 
         post_data = self._decode_request(data)
@@ -340,6 +363,28 @@ class SyntheticThingServer:
                     if self.local_key
                     else []
                 )
+        elif action == "smartlife.m.api.batch.invoke":
+            beans = post_data["apis"]
+            assert isinstance(beans, list) and beans
+            responses = []
+            for bean in beans:
+                assert bean["et"] == "3" and bean["requestId"] and bean["sign"]
+                bean_key = derive_request_key(
+                    bean["requestId"],
+                    self.profile.encryption_secret,
+                    "synthetic-ecode",
+                )
+                bean_post = json.loads(decrypt_mobile_payload(bean["params"], bean_key))
+                responses.append(
+                    {
+                        "a": bean["a"],
+                        "success": True,
+                        "result": {"api": bean["a"], "postData": bean_post},
+                    }
+                )
+            result = responses
+        elif action == "m.life.app.smart.local.device.list":
+            result = [{"devId": "local-dev", "homeId": post_data["homeId"]}]
         else:
             raise AssertionError(f"unexpected API action {action}")
 
@@ -664,7 +709,10 @@ class CryptoTests(unittest.TestCase):
             canonical,
             f"a=thing.m.test||postData={swapped}||time=123||v=3.0",
         )
-        expected = hmac.new(b"key", canonical.encode(), hashlib.sha256).hexdigest()
+        inner = hashlib.md5(b"key", usedforsecurity=False).hexdigest()
+        expected = hashlib.md5(
+            inner.encode() + canonical.encode(), usedforsecurity=False
+        ).hexdigest()
         self.assertEqual(sign_mobile_params(params, b"key"), expected)
         with self.assertRaisesRegex(ValueError, "32-character"):
             _swap_md5_blocks("short")
@@ -1098,7 +1146,9 @@ class MobileFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.login()
 
     async def test_validation_no_session_and_response_compression(self) -> None:
-        with self.assertRaisesRegex(MobileAuthenticationError, "requires a login session"):
+        # checkApiParams: a session-required request with no session fails
+        # locally as USER_SESSION_LOSS — no HTTP call leaves the client.
+        with self.assertRaisesRegex(MobileApiError, "USER_SESSION_LOSS"):
             await self.api.request("m.life.home.space.list", "1.0", {})
         for email, password, message in (("", "x", "email"), ("x", "", "password")):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
@@ -1182,6 +1232,143 @@ class MobileFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(config.device_id, discovered.device_id)
         self.assertEqual(config.local_key, server.local_key)
+
+    async def test_time_validate_failed_retries_once_with_new_request_id(self) -> None:
+        await self.login()
+        action = "m.life.home.space.list"
+        self.server.error_once_by_action[action] = ("TIME_VALIDATE_FAILED", "clock skew")
+        counter = iter(range(1_000))
+        self.api._uuid_factory = lambda: uuid.UUID(int=next(counter))
+
+        result = await self.api.request(action, "1.0")
+        self.assertEqual(result, self.server.home_list_result)
+        calls = [c for c in self.server.calls if c["a"] == action]
+        self.assertEqual(len(calls), 2)
+        # retryTime 1→0: exactly one re-request, fresh requestId.
+        self.assertNotEqual(calls[0]["requestId"], calls[1]["requestId"])
+        # TimeStampManager.updateTimeStamp(t) — the offset is applied to `time`.
+        self.assertEqual(
+            int(calls[1]["time"]),
+            int(1234.9 + (1_700_000_500 - 1234.9)),
+        )
+
+    async def test_time_validate_failed_second_failure_fails(self) -> None:
+        await self.login()
+
+        async def always_fails(url, data, headers, timeout):
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "success": False,
+                        "errorCode": "TIME_VALIDATE_FAILED",
+                        "errorMsg": "skew",
+                        "t": 1_700_000_500,
+                    }
+                ).encode(),
+            )
+
+        api = ThingMobileApi(
+            self.profile,
+            install_id="install-id",
+            timeout=4,
+            _post_form=always_fails,
+            _clock=lambda: 1234.9,
+            _uuid_factory=lambda: uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        )
+        api.session = self.api.session
+        with self.assertRaisesRegex(MobileApiError, "TIME_VALIDATE_FAILED"):
+            await api.request("m.life.home.space.list", "1.0")
+
+    async def test_session_invalid_broadcast_and_105_rewrite(self) -> None:
+        await self.login()
+        seen: list[MobileApiError] = []
+        self.api.on_session_invalid = seen.append
+        action = "m.life.home.space.list"
+        self.server.error_by_action[action] = ("USER_SESSION_INVALID", "gone")
+
+        with self.assertRaises(MobileApiError) as ctx:
+            await self.api.request(action, "1.0")
+        self.assertEqual(ctx.exception.code, "105")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].code, "USER_SESSION_INVALID")
+
+    async def test_region_scoped_request_uses_region_host(self) -> None:
+        await self.login()
+        urls: list[str] = []
+
+        async def recording_post(url, data, headers, timeout):
+            urls.append(url)
+            return await self.server(url, data, headers, timeout)
+
+        api = ThingMobileApi(
+            self.profile,
+            install_id="install-id",
+            timeout=4,
+            _post_form=recording_post,
+            _clock=lambda: 1234.9,
+            _uuid_factory=lambda: uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        )
+        api.session = self.api.session
+        self.server.expected_url = "https://a1.tuyaeu.com/api.json"
+        await api.request("m.life.home.space.list", "1.0", region="eu")
+        self.assertEqual(urls[-1], "https://a1.tuyaeu.com/api.json")
+
+    async def test_batch_invoke_signs_sub_requests(self) -> None:
+        await self.login()
+        beans_out = await self.account.batch_invoke(
+            (
+                ("m.life.my.group.device.list", "2.2", {"gid": 7}),
+                ("thing.m.my.shared.device.list", "3.2", {}),
+            ),
+            gid=7,
+        )
+        call = next(c for c in self.server.calls if c["a"] == "smartlife.m.api.batch.invoke")
+        self.assertEqual(call["gid"], "7")
+        post = self.server.plain_post_data[-1]
+        self.assertEqual(post["gid"], 7)
+        apis = post["apis"]
+        self.assertEqual(
+            [b["a"] for b in apis],
+            ["m.life.my.group.device.list", "smartlife.m.my.shared.device.list"],
+        )
+        for bean in apis:
+            self.assertEqual(bean["et"], "3")
+            self.assertEqual(bean["v"], apis[0]["v"] if bean is apis[0] else "3.2")
+            self.assertTrue(bean["requestId"] and bean["sign"] and bean["params"])
+        self.assertEqual(len(beans_out), 2)
+        self.assertEqual(beans_out[0]["a"], "m.life.my.group.device.list")
+
+    async def test_fetch_home_batch_order_and_local_list(self) -> None:
+        await self.login()
+        subscribed: list[str] = []
+        merged = await self.account.fetch_home(
+            7, mqtt_subscribe=lambda topic: subscribed.append(topic)
+        )
+        self.assertEqual(subscribed, ["m/ug/7"])
+        actions = [c["a"] for c in self.server.calls]
+        self.assertIn("smartlife.m.api.batch.invoke", actions)
+        self.assertIn("m.life.app.smart.local.device.list", actions)
+        post = next(p for p in self.server.plain_post_data if "apis" in p)
+        apis = [b["a"] for b in post["apis"]]
+        self.assertEqual(
+            apis,
+            [
+                "m.life.my.group.device.sort.list",
+                "m.life.my.group.device.list",
+                "m.life.my.group.mesh.list",
+                "m.life.my.group.device.group.list",
+                "m.life.location.get",
+                "m.life.device.ref.info.my.list",
+                "smartlife.m.my.shared.device.list",
+                "smartlife.m.my.shared.device.group.list",
+            ],
+        )
+        # ApiResponeBean.getApi un-rewrites smartlife→thing for the merged keys.
+        self.assertIn("thing.m.my.shared.device.list", merged)
+        self.assertIn("m.life.my.group.device.list", merged)
+        self.assertIn("m.life.app.smart.local.device.list", merged)
 
 
 class StdlibPosterTests(unittest.TestCase):

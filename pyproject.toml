@@ -28,3 +28,9 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]
+# Ported modules mirror the app's catch-Throwable semantics (listener dispatch,
+# frame parsing) — broad catches are the contract.
+"src/pypopur/**" = ["BLE001", "S110", "S112"]

@@ -1,109 +1,159 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import socket
+import threading
+import time
 import unittest
 from typing import Any
-from unittest.mock import patch
 
 from pypopur.exceptions import (
     HandshakeError,
     MissingLocalKey,
     ProtocolError,
-    TransportDependencyMissing,
     TransportError,
 )
-from pypopur.local import LocalDeviceConfig, LocalTuyaTransport, _default_device_factory
+from pypopur.local import LocalDeviceConfig, LocalTuyaTransport
+from pypopur.sdk.crypto import aes_ecb_decrypt, aes_ecb_encrypt
+from pypopur.sdk.lan_socket import (
+    SESS_KEY_NEG_FINISH,
+    SESS_KEY_NEG_RESP,
+    SESS_KEY_NEG_START,
+    SocketThingNetworkApi,
+    _ecb_nopad_encrypt,
+    pack_55aa,
+    read_frame,
+)
+
+REAL_KEY = "0123456789abcdef"
+
+DP_QUERY = 0x0A
+CONTROL = 0x07
+STATUS = 0x08
+HEART_BEAT = 0x09
 
 
-class FakeDevice:
-    def __init__(self, device_id: str, host: str, local_key: str, owner: Factory) -> None:
-        self.device_id = device_id
-        self.host = host
-        self.local_key = local_key
-        self.owner = owner
-        self.version: float | None = None
-        self.closed = False
-        self.writes: list[dict[str, Any]] = []
-        owner.devices.append(self)
-
-    def set_version(self, version: float) -> None:
-        self.version = version
-
-    def set_socketTimeout(self, timeout: float) -> None:
-        self.timeout = timeout
-
-    def set_socketPersistent(self, value: bool) -> None:
-        self.persistent = value
-
-    def status(self) -> dict[str, Any]:
-        return self.owner.status_for(self.version)
-
-    def set_multiple_values(self, data: dict[str, Any]) -> dict[str, Any]:
-        self.writes.append(dict(data))
-        return self.owner.write_result
-
-    def close(self) -> None:
-        self.closed = True
+def _wait_for(pred, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition not met within timeout")
 
 
-class Factory:
-    def __init__(self) -> None:
-        self.devices: list[FakeDevice] = []
-        self.responses: dict[float, dict[str, Any]] = {
-            3.5: {"dps": {"1": True, "101": "0100000000"}}
-        }
-        self.write_result: dict[str, Any] = {}
+class FakeDevice34:
+    """Simulated lpv=3.4 device: session-key exchange, then answers
+    DP_QUERY with a scripted ``{dps:...}`` body and records CONTROL
+    payload inners (post session-ECB decrypt)."""
 
-    def __call__(self, device_id: str, host: str, local_key: str) -> FakeDevice:
-        return FakeDevice(device_id, host, local_key, self)
+    def __init__(self, key: bytes, status_dps: dict | None = None) -> None:
+        self.key = key
+        self.session_key: bytes | None = None
+        self.remote_nonce = bytes(range(0xA0, 0xB0))
+        self.status_dps = status_dps if status_dps is not None else {"1": True}
+        self.received: list[tuple[int, bytes]] = []
+        self.control_inners: list[dict] = []
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.port = self.listener.getsockname()[1]
+        self.conn: socket.socket | None = None
+        self.buf = bytearray()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
 
-    def status_for(self, version: float | None) -> dict[str, Any]:
-        assert version is not None
-        return self.responses.get(version, {"Error": "key or version", "Err": "914"})
+    def _read(self, key: bytes):
+        seq, cmd, _retcode, payload, ok = read_frame(self.conn, self.buf, key, no_retcode=True)
+        if not ok:
+            raise AssertionError("bad frame")
+        return seq, cmd, payload
+
+    def _run(self) -> None:
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return  # listener closed before any connection
+        self.conn = conn
+        _, cmd, payload = self._read(self.key)
+        assert cmd == SESS_KEY_NEG_START
+        local = aes_ecb_decrypt(self.key, payload)
+        resp = self.remote_nonce + hmac.new(self.key, local, hashlib.sha256).digest()
+        conn.sendall(
+            pack_55aa(1, SESS_KEY_NEG_RESP, aes_ecb_encrypt(self.key, resp), self.key, retcode=0)
+        )
+        _, cmd, payload = self._read(self.key)
+        assert cmd == SESS_KEY_NEG_FINISH
+        finish = aes_ecb_decrypt(self.key, payload)
+        assert finish == hmac.new(self.key, self.remote_nonce, hashlib.sha256).digest()
+        xored = bytes(a ^ b for a, b in zip(local, self.remote_nonce))
+        self.session_key = _ecb_nopad_encrypt(self.key, xored)[:16]
+        while True:
+            try:
+                _, cmd, payload = self._read(self.session_key)
+            except Exception:  # noqa: BLE001
+                return
+            inner = aes_ecb_decrypt(self.session_key, payload)
+            self.received.append((cmd, inner))
+            if cmd == DP_QUERY:
+                # The app's queryDps sends {"gwId":..,"devId":..} raw JSON;
+                # the device answers with a raw {"dps":{...}} body.
+                body = json.dumps({"dps": self.status_dps}).encode()
+                conn.sendall(
+                    pack_55aa(
+                        2,
+                        DP_QUERY,
+                        aes_ecb_encrypt(self.session_key, body),
+                        self.session_key,
+                        retcode=0,
+                    )
+                )
+            elif cmd == CONTROL:
+                obj = json.loads(inner[15:].decode())
+                self.control_inners.append(obj)
+
+    def push_status(self, dps: dict) -> None:
+        """Send a spontaneous STATUS push (3.4 wrapped inner)."""
+        inner = (
+            b"3.4"
+            + b"\x00" * 4
+            + (1).to_bytes(4, "big")
+            + (0).to_bytes(4, "big")
+            + json.dumps({"protocol": 5, "data": {"dps": dps}, "t": int(time.time())}).encode()
+        )
+        self.conn.sendall(
+            pack_55aa(
+                3,
+                STATUS,
+                aes_ecb_encrypt(self.session_key, inner),
+                self.session_key,
+                retcode=0,
+            )
+        )
+
+    def stop(self) -> None:
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        finally:
+            self.listener.close()
 
 
-class MinimalDevice:
-    def __init__(self) -> None:
-        self.version: float | None = None
-        self.closed = False
-
-    def set_version(self, version: float) -> None:
-        self.version = version
-
-    def status(self) -> dict[str, Any]:
-        return {"dps": {"1": True}}
-
-    def set_multiple_values(self, data: dict[str, Any]) -> dict[str, Any]:
-        return {}
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class ScriptedDevice(FakeDevice):
-    def __init__(
-        self,
-        device_id: str,
-        host: str,
-        local_key: str,
-        owner: Factory,
-        statuses: list[Any],
-        write_result: Any = None,
-    ) -> None:
-        super().__init__(device_id, host, local_key, owner)
-        self.statuses = list(statuses)
-        self.scripted_write_result = {} if write_result is None else write_result
-
-    def status(self) -> Any:
-        result = self.statuses.pop(0)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    def set_multiple_values(self, data: dict[str, Any]) -> Any:
-        self.writes.append(dict(data))
-        if isinstance(self.scripted_write_result, Exception):
-            raise self.scripted_write_result
-        return self.scripted_write_result
+def _transport(dev: FakeDevice34, **kw: Any) -> LocalTuyaTransport:
+    api = SocketThingNetworkApi(port=dev.port)
+    return LocalTuyaTransport(
+        "127.0.0.1",
+        "dev",
+        REAL_KEY,
+        api=api,
+        protocol_version="3.4",
+        timeout=3.0,
+        **kw,
+    )
 
 
 class LocalTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -124,332 +174,104 @@ class LocalTransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "timeout"):
             LocalTuyaTransport("192.0.2.1", "dev", "key", timeout=0)
 
-    def test_default_factory_has_clean_dependency_error_and_success_path(self) -> None:
-        with (
-            patch("pypopur.local.import_module", side_effect=ImportError("missing")),
-            self.assertRaises(TransportDependencyMissing),
-        ):
-            _default_device_factory("dev", "192.0.2.1", "key")
-
-        sentinel = MinimalDevice()
-
-        class FakeTinyTuya:
-            @staticmethod
-            def Device(device_id: str, host: str, local_key: str) -> MinimalDevice:
-                self_tuple = (device_id, host, local_key)
-                if self_tuple != ("dev", "192.0.2.1", "key"):
-                    raise AssertionError(self_tuple)
-                return sentinel
-
-        with patch("pypopur.local.import_module", return_value=FakeTinyTuya):
-            self.assertIs(_default_device_factory("dev", "192.0.2.1", "key"), sentinel)
-
-    def test_response_parsing_and_safe_close_helpers(self) -> None:
-        self.assertIsNone(LocalTuyaTransport._response_error("not-a-map"))
-        self.assertIsNone(LocalTuyaTransport._response_error({"dps": {}}))
-        self.assertEqual(
-            LocalTuyaTransport._response_error({"Error": "bad", "Err": "not-an-int"}),
-            (None, "bad"),
-        )
-        with self.assertRaisesRegex(TransportError, "unknown TinyTuya error"):
-            LocalTuyaTransport._raise_response_error({"Err": 902})
-        with self.assertRaisesRegex(ProtocolError, "not a mapping"):
-            LocalTuyaTransport._extract_dps([])
-        with self.assertRaisesRegex(ProtocolError, "DPS mapping"):
-            LocalTuyaTransport._extract_dps({"ok": True})
-
-        LocalTuyaTransport._safe_close_sync(None)
-
-        class BadClose(MinimalDevice):
-            def close(self) -> None:
-                raise OSError("already gone")
-
-        LocalTuyaTransport._safe_close_sync(BadClose())
-
-    def test_make_device_handles_optional_tuning_and_bad_versions(self) -> None:
-        minimal = MinimalDevice()
-        transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "key", _device_factory=lambda *_: minimal
-        )
-        self.assertIs(transport._make_device("3.5"), minimal)
-        self.assertEqual(minimal.version, 3.5)
-
-        class BadVersion(MinimalDevice):
-            def set_version(self, version: float) -> None:
-                raise ValueError("unsupported")
-
-        bad = BadVersion()
-        bad_transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "key", _device_factory=lambda *_: bad
-        )
-        with self.assertRaisesRegex(ProtocolError, "Unsupported local protocol"):
-            bad_transport._make_device("9.9")
-        self.assertTrue(bad.closed)
-
-    async def test_raw_key_settings_use_base64_on_wire_and_hex_in_cache(self) -> None:
-        factory = Factory()
-        transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "key", protocol_version="3.5", _device_factory=factory
-        )
-        values = {105: "00010201030104", 1: True, 125: 0, 109: "power_on"}
+    async def test_connect_read_write_close_end_to_end(self) -> None:
+        dev = FakeDevice34(REAL_KEY.encode(), {"1": True, "101": "0100000000"})
+        transport = _transport(dev)
         try:
-            await transport.write_dps(values)
+            await transport.connect()
+            await transport.connect()
+            self.assertTrue(transport.connected)
+            self.assertEqual(transport.protocol_version, "3.4")
+            self.assertEqual(transport.config.device_id, "dev")
+
+            self.assertEqual(await transport.read_dps(), {1: True, 101: "0100000000"})
+            # The DP_QUERY request the app sends is {"gwId":..,"devId":..}.
+            queries = [i for c, i in dev.received if c == DP_QUERY]
+            self.assertEqual(json.loads(queries[-1]), {"gwId": "dev", "devId": "dev"})
+
+            await transport.write_dps({102: "00" * 29, 1: True})
+            _wait_for(lambda: len(dev.control_inners) >= 1)
+            inner = dev.control_inners[-1]
+            self.assertEqual(inner["protocol"], 5)
+            self.assertIn("t", inner)
+            self.assertEqual(inner["data"]["devId"], "dev")
             self.assertEqual(
-                factory.devices[0].writes[-1],
-                {"105": "AAECAQMBBA==", "1": True, "125": 0, "109": "power_on"},
+                inner["data"]["dps"],
+                {"102": base64.b64encode(b"\x00" * 29).decode(), "1": True},
             )
-            self.assertEqual(await transport.read_dps({105}), {105: "00010201030104"})
-            self.assertEqual(values[105], "00010201030104")
+
+            # A STATUS push lands via the 3.4 parse chain and merges.
+            dev.push_status({"1": False})
+            _wait_for(lambda: transport._last_dps.get(1) is False)
+            # read_dps issues a live query — the next answer overwrites
+            # the pushed value, so update the script accordingly.
+            dev.status_dps = {"1": False}
+            self.assertEqual(await transport.read_dps({1}), {1: False})
         finally:
             await transport.close()
-
-    async def test_explicit_protocol_connect_read_filter_write_and_close(self) -> None:
-        factory = Factory()
-        factory.responses = {3.4: {"dps": {"1": True, "101": "0100000000"}}}
-        transport = LocalTuyaTransport(
-            "192.0.2.1",
-            "dev",
-            "legitimate-local-key",
-            protocol_version="3.4",
-            _device_factory=factory,
-        )
-        await transport.connect()
-        await transport.connect()
-        self.assertEqual(len(factory.devices), 1)
-        self.assertTrue(transport.connected)
-        self.assertEqual(transport.config.device_id, "dev")
-        self.assertEqual(transport.protocol_version, "3.4")
-        self.assertEqual(await transport.read_dps({101}), {101: "0100000000"})
-        await transport.write_dps({102: "00" * 29, 1: True})
-        self.assertEqual(
-            factory.devices[0].writes[-1],
-            {"102": "A" * 39 + "=", "1": True},
-        )
-        await transport.close()
-        await transport.close()
-        self.assertTrue(factory.devices[0].closed)
+            dev.stop()
         self.assertFalse(transport.connected)
         self.assertIsNone(transport.protocol_version)
-
-    async def test_auto_probe_can_select_35_or_34_without_writes(self) -> None:
-        for selected, responses, expected_versions in (
-            ("3.5", {3.5: {"dps": {"1": True}}}, [3.5]),
-            (
-                "3.4",
-                {
-                    3.5: {"Error": "key or version", "Err": "914"},
-                    3.4: {"dps": {"1": True}},
-                },
-                [3.5, 3.4],
-            ),
-        ):
-            with self.subTest(selected=selected):
-                factory = Factory()
-                factory.responses = responses
-                transport = LocalTuyaTransport("192.0.2.1", "dev", "key", _device_factory=factory)
-                await transport.connect()
-                self.assertEqual(transport.protocol_version, selected)
-                self.assertEqual([device.version for device in factory.devices], expected_versions)
-                self.assertTrue(all(not device.writes for device in factory.devices))
-                await transport.close()
-
-    async def test_auto_probe_uses_read_only_status_and_selects_33_after_newer_failures(
-        self,
-    ) -> None:
-        factory = Factory()
-        factory.responses = {
-            3.5: {"Error": "key or version", "Err": "914"},
-            3.4: {"Error": "key or version", "Err": "914"},
-            3.3: {"dps": {"1": False, "105": "00010001020103"}},
-        }
-        transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "legitimate-local-key", _device_factory=factory
-        )
-        await transport.connect()
-        self.assertEqual(transport.protocol_version, "3.3")
-        self.assertEqual([device.version for device in factory.devices], [3.5, 3.4, 3.3])
-        self.assertTrue(factory.devices[0].closed)
-        self.assertTrue(factory.devices[1].closed)
-        self.assertFalse(factory.devices[2].closed)
-        self.assertEqual(factory.devices[0].writes, [])
-        self.assertEqual(factory.devices[1].writes, [])
-        self.assertEqual(factory.devices[2].writes, [])
         await transport.close()
 
-    async def test_key_or_version_error_is_not_misreported_as_invalid_key(self) -> None:
-        factory = Factory()
-        factory.responses = {
-            3.5: {"Error": "key or version", "Err": "914"},
-            3.4: {"Error": "key or version", "Err": "914"},
-            3.3: {"Error": "key or version", "Err": "914"},
-        }
+    async def test_connection_refused_is_handshake_error(self) -> None:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.close()  # closed port → connect fails
+        api = SocketThingNetworkApi(port=port)
         transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "maybe-wrong-key", _device_factory=factory
-        )
-        with self.assertRaisesRegex(HandshakeError, "does not provide enough evidence"):
-            await transport.connect()
-
-    async def test_non_auth_tinytuya_error_is_transport_error(self) -> None:
-        factory = Factory()
-        factory.responses = {3.4: {"Error": "timeout", "Err": "902"}}
-        transport = LocalTuyaTransport(
-            "192.0.2.1",
+            "127.0.0.1",
             "dev",
-            "key",
+            REAL_KEY,
+            api=api,
             protocol_version="3.4",
-            _device_factory=factory,
+            timeout=1.0,
         )
-        with self.assertRaises(TransportError):
+        with self.assertRaises(HandshakeError):
             await transport.connect()
 
-    async def test_mixed_auto_probe_failures_are_transport_error_not_auth_error(self) -> None:
-        factory = Factory()
-        factory.responses = {
-            3.5: {"Error": "key or version", "Err": "914"},
-            3.4: {"Error": "timeout", "Err": "902"},
-            3.3: {"Error": "key or version", "Err": "914"},
-        }
-        transport = LocalTuyaTransport("192.0.2.1", "dev", "key", _device_factory=factory)
-        with self.assertRaisesRegex(TransportError, "Unable to connect") as raised:
-            await transport.connect()
-        self.assertNotIsInstance(raised.exception, HandshakeError)
+    async def test_handshake_timeout_is_transport_error(self) -> None:
+        # Device accepts the TCP link but never answers the negotiation.
+        dev = socket.socket()
+        dev.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        dev.bind(("127.0.0.1", 0))
+        dev.listen(1)
+        port = dev.getsockname()[1]
+        holder: list[socket.socket] = []
 
-    async def test_dependency_error_is_not_swallowed_by_negotiation(self) -> None:
-        def missing_factory(*_: str) -> MinimalDevice:
-            raise TransportDependencyMissing("missing tinytuya")
+        def accept() -> None:
+            conn, _ = dev.accept()
+            holder.append(conn)
 
-        transport = LocalTuyaTransport("192.0.2.1", "dev", "key", _device_factory=missing_factory)
-        with self.assertRaises(TransportDependencyMissing):
-            await transport.connect()
-
-    async def test_probe_wraps_low_level_status_errors_and_closes_device(self) -> None:
-        factory = Factory()
-
-        def device_factory(device_id: str, host: str, local_key: str) -> ScriptedDevice:
-            return ScriptedDevice(
-                device_id,
-                host,
-                local_key,
-                factory,
-                [OSError("socket down")],
-            )
-
+        threading.Thread(target=accept, daemon=True).start()
+        api = SocketThingNetworkApi(port=port)
         transport = LocalTuyaTransport(
-            "192.0.2.1",
+            "127.0.0.1",
             "dev",
-            "key",
-            protocol_version="3.5",
-            _device_factory=device_factory,
+            REAL_KEY,
+            api=api,
+            protocol_version="3.4",
+            timeout=1.0,
         )
-        with self.assertRaisesRegex(TransportError, "status probe failed"):
-            await transport.connect()
-        self.assertTrue(factory.devices[0].closed)
+        try:
+            with self.assertRaisesRegex(TransportError, "timed out"):
+                await transport.connect()
+        finally:
+            dev.close()
+            for c in holder:
+                c.close()
 
-    async def test_read_error_paths_and_unfiltered_read(self) -> None:
-        factory = Factory()
-
-        def device_factory(device_id: str, host: str, local_key: str) -> ScriptedDevice:
-            return ScriptedDevice(
-                device_id,
-                host,
-                local_key,
-                factory,
-                [
-                    {"dps": {"1": True, "154": 12}},
-                    {"dps": {"1": False, "154": 13}},
-                    OSError("read failed"),
-                ],
-            )
-
-        transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "key", protocol_version="3.5", _device_factory=device_factory
-        )
-        self.assertEqual(await transport.read_dps(), {1: False, 154: 13})
-        with self.assertRaisesRegex(TransportError, "status read failed"):
-            await transport.read_dps()
-        await transport.close()
-
-        protocol_factory = Factory()
-
-        def protocol_device_factory(device_id: str, host: str, local_key: str) -> ScriptedDevice:
-            return ScriptedDevice(
-                device_id,
-                host,
-                local_key,
-                protocol_factory,
-                [{"dps": {"1": True}}, {"missing": "dps"}],
-            )
-
-        protocol_transport = LocalTuyaTransport(
-            "192.0.2.1",
-            "dev",
-            "key",
-            protocol_version="3.5",
-            _device_factory=protocol_device_factory,
-        )
-        with self.assertRaises(ProtocolError):
-            await protocol_transport.read_dps()
-        await protocol_transport.close()
-
-    async def test_read_merges_partial_status_with_connection_probe(self) -> None:
-        factory = Factory()
-
-        def device_factory(device_id: str, host: str, local_key: str) -> ScriptedDevice:
-            return ScriptedDevice(
-                device_id,
-                host,
-                local_key,
-                factory,
-                [
-                    {"dps": {"101": "0100000000", "154": 12}},
-                    {"dps": {"154": 13}},
-                ],
-            )
-
-        transport = LocalTuyaTransport(
-            "192.0.2.1",
-            "dev",
-            "key",
-            protocol_version="3.5",
-            _device_factory=device_factory,
-        )
-        self.assertEqual(
-            await transport.read_dps(),
-            {101: "0100000000", 154: 13},
-        )
-        await transport.close()
-
-    async def test_write_noop_response_error_and_low_level_exception(self) -> None:
-        factory = Factory()
-        transport = LocalTuyaTransport(
-            "192.0.2.1", "dev", "key", protocol_version="3.5", _device_factory=factory
-        )
-        await transport.write_dps({})
-        self.assertEqual(factory.devices, [])
-
-        factory.write_result = {"Error": "denied", "Err": 902}
-        with self.assertRaisesRegex(TransportError, "denied"):
-            await transport.write_dps({1: True})
-        await transport.close()
-
-        low_level_factory = Factory()
-
-        def device_factory(device_id: str, host: str, local_key: str) -> ScriptedDevice:
-            return ScriptedDevice(
-                device_id,
-                host,
-                local_key,
-                low_level_factory,
-                [{"dps": {"1": True}}],
-                RuntimeError("write exploded"),
-            )
-
-        low_level = LocalTuyaTransport(
-            "192.0.2.1", "dev", "key", protocol_version="3.5", _device_factory=device_factory
-        )
-        with self.assertRaisesRegex(TransportError, "DPS write failed"):
-            await low_level.write_dps({1: True})
-        await low_level.close()
+    async def test_raw_dp_hex_rejected_before_io(self) -> None:
+        dev = FakeDevice34(REAL_KEY.encode())
+        transport = _transport(dev)
+        try:
+            with self.assertRaisesRegex(ProtocolError, "DP105"):
+                await transport.write_dps({105: "not-hex-or-b64!!"})
+            self.assertFalse(dev.control_inners)
+        finally:
+            await transport.close()
+            dev.stop()
 
 
 if __name__ == "__main__":

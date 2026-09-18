@@ -2,7 +2,13 @@
 
 from .bootstrap import LocalConfigBootstrap, resolve_local_config
 from .client import PopurClient
-from .cloud import CloudBackend, CloudTransport
+from .cloud import (
+    AtopCloudBackend,
+    CloudBackend,
+    CloudTransport,
+    build_business,
+    build_device_api,
+)
 from .discovery import DiscoveredS7, discover_s7, parse_scan_results
 from .dps import (
     FAULT_ITEMS,
@@ -105,6 +111,7 @@ from .models import (
     TimerSlice,
     WeightFunctionSettings,
 )
+from .pipeline import PipelineTransport
 from .reference import (
     DP_ALIAS_COUNT,
     DP_ALIASES,
@@ -142,6 +149,7 @@ __all__ = [
     "AccountDevice",
     "AccountDeviceNotFound",
     "ActiveShieldSettings",
+    "AtopCloudBackend",
     "AuthenticationError",
     "BinStatus",
     "CalibrationLevel",
@@ -175,6 +183,7 @@ __all__ = [
     "MobileSession",
     "NotificationSettings",
     "PanelToggles",
+    "PipelineTransport",
     "PopurAccount",
     "PopurClient",
     "PopurError",
@@ -200,6 +209,8 @@ __all__ = [
     "bootstrap_discovered_s7",
     "bootstrap_discovered_s7_from_apk",
     "bootstrap_discovered_s7_popur_app2",
+    "build_business",
+    "build_device_api",
     "canonical_sign_input",
     "decode_dp22",
     "decode_dp101",

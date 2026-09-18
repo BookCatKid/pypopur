@@ -53,7 +53,8 @@ class RawHelperHardeningTests(unittest.TestCase):
         self.assertEqual(decode_raw_bytes(memoryview(b"\x01\x02")), b"\x01\x02")
         self.assertEqual(decode_raw_bytes(""), b"")
         self.assertIsNone(decode_raw_bytes("[not-json]"))
-        self.assertIsNone(decode_raw_bytes("[true, 1]"))
+        # toIntOrNull drops the bad token, "1" survives — Java decodeToBytes
+        self.assertEqual(decode_raw_bytes("[true, 1]"), b"\x01")
         self.assertEqual(decode_raw_bytes((1, "skip", True, 257)), b"\x01\x01")
         self.assertIsNone(decode_raw_bytes([]))
         self.assertIsNone(decode_raw_bytes(object()))

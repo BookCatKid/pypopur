@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import json
-from collections.abc import Collection
 from typing import Any
 
 from .exceptions import ProtocolError
@@ -14,49 +12,24 @@ from .exceptions import ProtocolError
 def decode_raw_bytes(value: Any, *, allow_base64: bool = False) -> bytes | None:
     """Decode the raw encodings accepted by the Popur app into bytes.
 
-    The Android app accepts byte arrays, numeric collections, hexadecimal strings,
-    and strings containing a JSON-style integer array. Thing mobile device records
-    additionally return RAW datapoints as padded Base64 strings.
+    Delegates to ``Dp102SystemSettings.decodeToBytes`` semantics
+    (``app.dp101.decode_to_bytes``): byte arrays, ``[int, int, ...]`` strings
+    (comma-split, non-integer tokens skipped), hex strings, and Collections
+    of Numbers via ``intValue()``.  ``allow_base64`` is a pypopur extension:
+    the app does base64→hex at the transport boundary (``DevUtil.decodeRaw``),
+    never inside the DP codec; keep it for mobile records.
     """
 
-    if value is None:
+    from .app.dp101 import decode_to_bytes
+
+    decoded = decode_to_bytes(value)
+    if decoded is not None or not (allow_base64 and isinstance(value, str)):
+        return decoded
+    compact = "".join(value.split())
+    try:
+        return base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError):
         return None
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, (bytearray, memoryview)):
-        return bytes(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if text.startswith("[") and text.endswith("]"):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, list) and all(
-                isinstance(item, int) and not isinstance(item, bool) for item in parsed
-            ):
-                return bytes(item & 0xFF for item in parsed)
-        compact = "".join(text.split())
-        if len(compact) % 2:
-            return None
-        try:
-            return bytes.fromhex(compact)
-        except ValueError:
-            if not allow_base64:
-                return None
-            try:
-                return base64.b64decode(compact, validate=True)
-            except (binascii.Error, ValueError):
-                return None
-    if isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray)):
-        numeric: list[int] = []
-        for item in value:
-            if isinstance(item, bool) or not isinstance(item, int):
-                continue
-            numeric.append(item)
-        if numeric:
-            return bytes(item & 0xFF for item in numeric)
-    return None
 
 
 def require_raw_bytes(value: Any, *, dp: int | None = None) -> bytes:

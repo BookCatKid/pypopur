@@ -68,6 +68,27 @@ class PopurClient:
             )
         )
 
+    @classmethod
+    def pipeline(
+        cls,
+        device_id: str,
+        *,
+        local: Any = None,
+        cloud: Any = None,
+        **kwargs: Any,
+    ) -> PopurClient:
+        """Create a client on the app's ``publishDps`` channel router.
+
+        ``local``/``cloud`` are a :class:`LocalTuyaTransport` and a
+        ``CloudChannelBackend``-compatible backend; writes route
+        LAN-first with the 500 ms watchdog → MQTT/HTTP fallback,
+        mirroring the APK's ``publishDpsInPipeline``.
+        """
+
+        from .pipeline import PipelineTransport
+
+        return cls(PipelineTransport(device_id, local=local, cloud=cloud, **kwargs))
+
     @property
     def connected(self) -> bool:
         return self._connected

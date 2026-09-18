@@ -151,33 +151,22 @@ def decode_dp101(value: Any) -> RunModeReport | None:
     )
 
 
-def decode_dp109_machine_status(value: Any) -> MachineStatus | None:
-    """Decode the scalar machine-work-mode fallback reported by live S7 firmware."""
+def decode_dp126_cat_presence(value: Any) -> CatPresence | None:
+    """Decode the scalar DP126 cat-presence fallback.
 
-    if isinstance(value, MachineStatus):
+    ``DeviceFunctionBarStateKt`` falls back to ``dps["126"]`` only when
+    DP101 yields no cat presence, and only when the value is a String —
+    non-String values produce null.
+    """
+
+    if isinstance(value, CatPresence):
         return value
     if not isinstance(value, str):
         return None
     try:
-        return MachineStatus(value.strip().lower())
+        return CatPresence(value.strip().lower())
     except ValueError:
         return None
-
-
-def decode_dp126_cat_presence(value: Any) -> CatPresence | None:
-    """Decode the scalar cat-presence fallback used by the current app cache."""
-
-    if isinstance(value, CatPresence):
-        return value
-    if isinstance(value, str):
-        try:
-            return CatPresence(value.strip().lower())
-        except ValueError:
-            pass
-    index = _decode_int_scalar(value)
-    if index is None or not 0 <= index < len(_CAT_VALUES):
-        return None
-    return _CAT_VALUES[index]
 
 
 def encode_dp101(report: RunModeReport) -> str:
@@ -363,6 +352,143 @@ def patch_dp102(value: Any, **changes: Any) -> str:
 
     settings = decode_dp102(value) or SystemSettings()
     return encode_dp102(replace(settings, **changes))
+
+
+# -- ``Dp102SystemSettings.bytesWith*`` granular mutators ----------------------
+#
+# Each decodes the payload (``decodeToBytes``), pads/truncates to 29 bytes
+# (``normalizeBytes``), mutates one field, and returns the 29-byte array.
+# Unknown/reserved bytes are always preserved.
+
+
+def _dp102_norm(value: Any) -> bytearray:
+    return bytearray(normalize_bytes(decode_raw_bytes(value), DP102_LENGTH))
+
+
+def dp102_bytes_with_byte(value: Any, index: int, byte: int) -> bytes:
+    """``bytesWithByte`` — ``bytes[index] = byte & 0xff``."""
+    out = _dp102_norm(value)
+    out[index] = byte & 0xFF
+    return bytes(out)
+
+
+def dp102_bytes_with_toggle(value: Any, index: int, enabled: bool) -> bytes:
+    """``bytesWithToggle`` — ``bytes[index] = 1/0``."""
+    out = _dp102_norm(value)
+    out[index] = 1 if enabled else 0
+    return bytes(out)
+
+
+def dp102_bytes_with_notification_bit(
+    value: Any, index: int, bit_mask: int, enabled: bool
+) -> bytes:
+    """``bytesWithNotificationBit`` — set/clear ``bit_mask`` in ``bytes[index]``."""
+    out = _dp102_norm(value)
+    old = out[index] if index < len(out) else 0
+    out[index] = (old | bit_mask) if enabled else (old & ~bit_mask)
+    return bytes(out)
+
+
+def dp102_bytes_with_weight_function_bit(value: Any, bit_mask: int, enabled: bool) -> bytes:
+    """``bytesWithWeightFunctionBit`` — bit op on byte 22."""
+    return dp102_bytes_with_notification_bit(value, 22, bit_mask, enabled)
+
+
+def dp102_bytes_with_detailed_notification_bit(value: Any, bit_mask: int, enabled: bool) -> bytes:
+    """``bytesWithDetailedNotificationBit`` — bit op on byte 27."""
+    return dp102_bytes_with_notification_bit(value, 27, bit_mask, enabled)
+
+
+def dp102_bytes_with_notification_master(value: Any, enabled: bool) -> bytes:
+    """``bytesWithNotificationMasterSwitch`` — byte 19."""
+    return dp102_bytes_with_toggle(value, 19, enabled)
+
+
+def dp102_bytes_with_smooth_spread(value: Any, count: int) -> bytes:
+    """``bytesWithSmoothSpread`` — byte 14, clamped 2..7."""
+    return dp102_bytes_with_byte(value, 14, clamp(count, 2, 7))
+
+
+def dp102_bytes_with_timezone(value: Any, offset_hours: int) -> bytes:
+    """``bytesWithTimezone`` — byte 15 signed, clamped -12..12."""
+    return dp102_bytes_with_byte(value, 15, clamp(offset_hours, -12, 12) & 0xFF)
+
+
+def dp102_bytes_with_device_color(value: Any, label: str) -> bytes:
+    """``bytesWithDeviceColor`` — byte 17 = 1 black / 0 white."""
+    return dp102_bytes_with_byte(value, 17, 1 if label.lower() == "black" else 0)
+
+
+def dp102_bytes_with_reshuffle_enabled(value: Any, enabled: bool) -> bytes:
+    """``bytesWithReshuffleEnabled`` — byte 26 bit 7."""
+    return dp102_bytes_with_notification_bit(value, 26, 0x80, enabled)
+
+
+def dp102_bytes_with_reshuffle_oscillation(value: Any, label: str) -> bytes:
+    """``bytesWithReshuffleOscillation`` — byte 26 low 7 bits = label index."""
+    out = _dp102_norm(value)
+    try:
+        index = DP102_RESHUFFLE_LABELS.index(label)
+    except ValueError:
+        index = 0
+    out[26] = (out[26] & 0x80) | (index & 0x7F)
+    return bytes(out)
+
+
+def _dp104_norm(value: Any) -> bytearray:
+    decoded = decode_raw_bytes(value)
+    if decoded is None or not decoded:
+        return bytearray(DP104_DEFAULT)
+    if len(decoded) >= 3:
+        return bytearray(decoded[:3])
+    out = bytearray(DP104_DEFAULT)
+    out[: len(decoded)] = decoded
+    return out
+
+
+def dp104_bytes_with_toggle(value: Any, bit_mask: int, enabled: bool) -> bytes:
+    """``Dp104DustbinSettings.bytesWithToggle`` — bit op on byte 0."""
+    out = _dp104_norm(value)
+    out[0] = (out[0] | bit_mask) if enabled else (out[0] & ~bit_mask)
+    return bytes(out)
+
+
+def dp104_bytes_with_calibration(value: Any, level: int) -> bytes:
+    """``bytesWithCalibration`` — byte 1, clamped 0..3."""
+    out = _dp104_norm(value)
+    out[1] = clamp(level, 0, 3)
+    return bytes(out)
+
+
+def dp104_bytes_with_cycle_count(value: Any, count: int) -> bytes:
+    """``bytesWithCycleCount`` — byte 2, clamped 1..10."""
+    out = _dp104_norm(value)
+    out[2] = clamp(count, 1, 10)
+    return bytes(out)
+
+
+def _dp103_norm(value: Any) -> bytearray:
+    return bytearray(normalize_bytes(decode_raw_bytes(value), DP103_LENGTH))
+
+
+def dp103_with_hibernate_duration(value: Any, minutes: int) -> bytes:
+    """``Dp103TimePowerOnOff.withHibernateDuration`` — byte 9."""
+    out = _dp103_norm(value)
+    out[9] = minutes & 0xFF
+    return bytes(out)
+
+
+def dp103_with_hibernate_start(value: Any, enabled: bool) -> bytes:
+    """``Dp103TimePowerOnOff.withHibernateStart`` — byte 8."""
+    out = _dp103_norm(value)
+    out[8] = 1 if enabled else 0
+    return bytes(out)
+
+
+def validate_value_range(value: int, minimum: int, maximum: int) -> int:
+    """``DeviceDpConstants.validateValueRange`` — inclusive clamp."""
+
+    return clamp(value, minimum, maximum)
 
 
 DP103_LENGTH = 10
@@ -705,11 +831,7 @@ def decode_snapshot(dps: Mapping[int | str, Any]) -> DeviceSnapshot:
     return DeviceSnapshot(
         raw_dps=raw,
         run_mode=run_mode,
-        machine_status=(
-            run_mode.machine_status
-            if run_mode is not None
-            else decode_dp109_machine_status(raw.get(109))
-        ),
+        machine_status=run_mode.machine_status if run_mode is not None else None,
         cat_presence=(
             run_mode.cat_presence
             if run_mode is not None

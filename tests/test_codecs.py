@@ -13,7 +13,6 @@ from pypopur.dps import (
     decode_dp104,
     decode_dp105,
     decode_dp106,
-    decode_dp109_machine_status,
     decode_dp125,
     decode_dp125_value,
     decode_dp126_cat_presence,
@@ -234,21 +233,19 @@ class PackedDpTests(unittest.TestCase):
         self.assertEqual(decode_dp22("cleanning_paused"), RecentActivity.CLEANING_PAUSED)
         self.assertEqual(RecentActivity.CAT_EXIST.display_text, "Pet detected")
 
-    def test_dp109_scalar_machine_status_fallback(self) -> None:
-        self.assertEqual(decode_dp109_machine_status("power_on"), MachineStatus.POWER_ON)
-        self.assertEqual(
-            decode_dp109_machine_status(MachineStatus.POWER_OFF), MachineStatus.POWER_OFF
-        )
-        self.assertIsNone(decode_dp109_machine_status("unknown"))
+    def test_no_dp109_machine_status_fallback(self) -> None:
+        # DeviceFunctionBarStateKt falls back to the raw "101" value, never a
+        # scalar "109" — no DP101 means no machine status.
         snapshot = decode_snapshot({109: "hibernating"})
         self.assertIsNone(snapshot.run_mode)
-        self.assertEqual(snapshot.machine_status, MachineStatus.HIBERNATING)
+        self.assertIsNone(snapshot.machine_status)
 
     def test_dp126_scalar_cat_presence_fallback(self) -> None:
-        self.assertEqual(decode_dp126_cat_presence(1), CatPresence.CAT_EXIST)
+        # String scalar only — non-String values produce null in the app.
         self.assertEqual(decode_dp126_cat_presence("cat_left"), CatPresence.CAT_LEFT)
-        self.assertIsNone(decode_dp126_cat_presence(99))
-        self.assertEqual(decode_snapshot({126: 3}).cat_presence, CatPresence.CAT_DONE_BUSINESS)
+        self.assertIsNone(decode_dp126_cat_presence(1))
+        self.assertIsNone(decode_dp126_cat_presence("unknown"))
+        self.assertIsNone(decode_snapshot({126: 3}).cat_presence)
 
     def test_standalone_notification_dp_mapping(self) -> None:
         settings = NotificationSettings(
