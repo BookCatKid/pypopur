@@ -1,0 +1,104 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Popur",
+        "description": "Sign in with the same email and password you use in the Popur app.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "install_id": "Install ID (optional)",
+          "scan_interval": "Poll interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_auth": "Invalid authentication"
+    },
+    "abort": {
+      "already_configured": "Account is already configured"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "machine_status": { "name": "Machine status" },
+      "running_status": { "name": "Running status" },
+      "bin_status": { "name": "Waste drawer level" },
+      "cat_presence": { "name": "Cat presence" },
+      "recent_activity": { "name": "Recent activity" },
+      "cat_weight": { "name": "Cat weight" },
+      "countdown": { "name": "Clean countdown" },
+      "daily_clean_count": { "name": "Daily clean cycles" },
+      "total_clean_count": { "name": "Total clean cycles" },
+      "clean_count_after_full": { "name": "Cycles since drawer emptied" },
+      "manual_clean_count": { "name": "Manual clean cycles" },
+      "scheduled_clean_count": { "name": "Scheduled clean cycles" },
+      "automatic_clean_count": { "name": "Automatic clean cycles" },
+      "total_use_time": { "name": "Total use time" },
+      "clean_duration": { "name": "Last clean duration" },
+      "cat_toilet_time": { "name": "Last toilet duration" },
+      "fault_free_time": { "name": "Fault-free time" },
+      "self_check": { "name": "Self-check progress" },
+      "pet_last_weight": { "name": "Last measured weight" },
+      "pet_last_visit_duration": { "name": "Last visit duration" },
+      "pet_last_visit": { "name": "Last visit" }
+    },
+    "binary_sensor": {
+      "bin_full": { "name": "Waste drawer full" },
+      "cat_present": { "name": "Cat present" },
+      "cleaning": { "name": "Cleaning" },
+      "fault": { "name": "Fault" },
+      "powered": { "name": "Powered" }
+    },
+    "switch": {
+      "power": { "name": "Power" },
+      "status_light": { "name": "Status light" },
+      "buzzer": { "name": "Buzzer" },
+      "anti_interference": { "name": "Anti-interference" },
+      "auto_clean": { "name": "Auto clean" },
+      "sentinel_mode": { "name": "Sentinel mode" },
+      "caring_mode": { "name": "Caring mode" },
+      "track_pet_data": { "name": "Track pet data" },
+      "auto_power_cycle": { "name": "Auto power cycle" },
+      "lower_speed": { "name": "Lower drum speed" },
+      "reshuffle": { "name": "Litter reshuffle" },
+      "auto_self_check": { "name": "Auto self-check" },
+      "notifications_master": { "name": "Notifications" },
+      "bin_full_detection": { "name": "Bin-full detection" },
+      "allow_overfill": { "name": "Allow overfill" },
+      "keep_upright": { "name": "Keep drawer upright" },
+      "block_on_full": { "name": "Block clean when full" },
+      "dump_override": { "name": "Dump override" },
+      "child_lock": { "name": "Child lock" }
+    },
+    "button": {
+      "clean_now": { "name": "Clean now" },
+      "pause_clean": { "name": "Pause clean" },
+      "resume_clean": { "name": "Resume clean" },
+      "self_check": { "name": "Self-check" },
+      "sifter_open": { "name": "Open sifter" },
+      "sifter_close": { "name": "Close sifter" },
+      "scoop_start": { "name": "Start scoop" },
+      "scoop_pause": { "name": "Pause scoop" },
+      "dustbin_open": { "name": "Open waste drawer" },
+      "dustbin_close": { "name": "Close waste drawer" },
+      "zero_bin": { "name": "Reset bin level" },
+      "recalibrate_spin": { "name": "Recalibrate spin sensor" },
+      "recalibrate_scale": { "name": "Recalibrate scale" },
+      "reboot": { "name": "Reboot" }
+    },
+    "select": {
+      "calibration_level": { "name": "Drawer calibration" },
+      "device_color": { "name": "Device color" },
+      "reshuffle_oscillation": { "name": "Reshuffle oscillation" }
+    },
+    "number": {
+      "clean_delay": { "name": "Clean delay" },
+      "radar_sensitivity": { "name": "Radar sensitivity" },
+      "radar_range": { "name": "Radar range" },
+      "smooth_spread_count": { "name": "Smooth spread count" },
+      "cycle_count": { "name": "Drawer cycle count" }
+    }
+  }
+}

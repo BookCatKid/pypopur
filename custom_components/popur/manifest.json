@@ -1,0 +1,12 @@
+{
+  "domain": "popur",
+  "name": "Popur",
+  "codeowners": ["@local"],
+  "config_flow": true,
+  "documentation": "https://github.com/local/pypopur",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "loggers": ["pypopur"],
+  "requirements": [],
+  "version": "0.1.0"
+}
