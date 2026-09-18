@@ -1470,7 +1470,9 @@ class PopurAccount:
             if any(piece in code for piece in ("PASSWORD", "PASSWD", "USER_", "LOGIN")):
                 raise MobileAuthenticationError(str(err)) from err
             raise
-        user = _require_mapping(result, "login")
+        return self._adopt_login_user(_require_mapping(result, "login"))
+
+    def _adopt_login_user(self, user: Mapping[str, Any]) -> MobileSession:
         raw_ecode = user.get("ecode")
         session = MobileSession(
             sid=_require_text(user, "sid", "login"),
@@ -1488,6 +1490,175 @@ class PopurAccount:
             self.api.set_api_host(mobile_api_url)
         return session
 
+    async def login_with_email_code(
+        self,
+        email: str,
+        code: str,
+        *,
+        country_code: str = "1",
+    ) -> MobileSession:
+        """``thing.m.user.email.code.login`` v3.0 — the app's
+        ``IThingUser.loginWithEmailCode`` path (verification-code sign-in)."""
+
+        if not email.strip():
+            raise ValueError("email must not be empty")
+        if not code:
+            raise ValueError("code must not be empty")
+        result = await self.api.request(
+            "thing.m.user.email.code.login",
+            "3.0",
+            {"countryCode": country_code, "email": email, "code": code},
+            session_required=False,
+            encrypted=True,
+        )
+        return self._adopt_login_user(_require_mapping(result, "login"))
+
+    async def send_email_code(self, email: str, *, country_code: str = "1") -> Any:
+        """``thing.m.user.email.code.send`` v1.0 — the app's
+        ``IThingUser.sendVerifyCodeWithUserName`` (fires the email)."""
+        return await self.api.request(
+            "thing.m.user.email.code.send",
+            "1.0",
+            {"countryCode": country_code, "email": email},
+            session_required=False,
+        )
+
+    async def verify_email_code(
+        self,
+        username: str,
+        code: str,
+        *,
+        country_code: str = "1",
+        code_type: int = 1,
+        server: str | None = None,
+    ) -> Any:
+        """``thing.m.user.username.code.verify`` v1.0 — the app's
+        ``IThingUser.checkCodeWithUserName``. ``server`` is the region
+        token the app forwards."""
+        post_data: dict[str, Any] = {
+            "countryCode": country_code,
+            "username": username,
+            "code": code,
+            "codeType": code_type,
+        }
+        if server is not None:
+            post_data["server"] = server
+        return await self.api.request(
+            "thing.m.user.username.code.verify", "1.0", post_data,
+            session_required=False,
+        )
+
+    async def register_email(
+        self,
+        email: str,
+        password: str,
+        *,
+        country_code: str = "1",
+    ) -> Any:
+        """``thing.m.user.email.register`` v1.0 — the app's
+        ``IThingUser.registerAccountWithEmail``. Same token + RSA
+        password flow as :meth:`login`."""
+        if not email.strip():
+            raise ValueError("email must not be empty")
+        if not password:
+            raise ValueError("password must not be empty")
+        token = await self._login_token(email, country_code)
+        return await self.api.request(
+            "thing.m.user.email.register",
+            "1.0",
+            {
+                "countryCode": country_code,
+                "email": email,
+                "passwd": _rsa_encrypt_password(password, token),
+                "token": _require_text(token, "token", "register token"),
+                "ifencrypt": 1,
+                "options": '{"group": 1}',
+            },
+            session_required=False,
+            encrypted=True,
+        )
+
+    async def reset_email_password(
+        self,
+        email: str,
+        email_code: str,
+        new_password: str,
+        *,
+        country_code: str = "1",
+    ) -> Any:
+        """``thing.m.user.email.password.reset`` v1.0 — the app's
+        ``IThingUser.resetEmailPassword`` (``{countryCode, email,
+        emailCode, newPasswd}``). ``newPasswd`` is the password's MD5
+        pre-hash (the reset call carries no token/ifencrypt fields,
+        so no RSA wrap)."""
+        return await self.api.request(
+            "thing.m.user.email.password.reset",
+            "1.0",
+            {
+                "countryCode": country_code,
+                "email": email,
+                "emailCode": email_code,
+                "newPasswd": hashlib.md5(
+                    new_password.encode(), usedforsecurity=False
+                ).hexdigest(),
+            },
+            session_required=False,
+        )
+
+    async def logout(self) -> Any:
+        """``thing.m.user.loginout`` v1.0 — the app's
+        ``IThingUser.logout``. ``uniqueKey`` is the session uid."""
+        session = self.api.session
+        result = await self.api.request(
+            "thing.m.user.loginout",
+            "1.0",
+            {"uniqueKey": session.uid if session else None},
+        )
+        self.api.session = None
+        return result
+
+    async def cancel_account(self) -> Any:
+        """``thing.m.user.apply.logout`` v1.0 — the app's
+        ``IThingUser.cancelAccount`` (account deletion)."""
+        session = self.api.session
+        result = await self.api.request(
+            "thing.m.user.apply.logout",
+            "1.0",
+            {"uniqueKey": session.uid if session else None},
+        )
+        self.api.session = None
+        return result
+
+    async def update_user(
+        self,
+        *,
+        nickname: str | None = None,
+        avatar: str | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """``thing.m.user.update`` v3.3 — profile fields
+        (``nickname``, ``avatar``, …)."""
+        post_data: dict[str, Any] = dict(extra or {})
+        if nickname is not None:
+            post_data["nickname"] = nickname
+        if avatar is not None:
+            post_data["avatar"] = avatar
+        return await self.api.request("thing.m.user.update", "3.3", post_data)
+
+    async def set_temp_unit(self, temp_unit: int | str) -> Any:
+        """``thing.m.user.unit.temp.update`` v2.0 — the temperature
+        unit preference (``{tempUnit}``)."""
+        return await self.api.request(
+            "thing.m.user.unit.temp.update", "2.0", {"tempUnit": temp_unit}
+        )
+
+    async def update_user_timezone(self, timezone_id: str) -> Any:
+        """``thing.m.user.timezone.update`` v1.0 — the account timezone
+        preference (``{timezoneId}``)."""
+        return await self.api.request(
+            "thing.m.user.timezone.update", "1.0", {"timezoneId": timezone_id}
+        )
+
     async def homes(self) -> tuple[Mapping[str, Any], ...]:
         # The SDK constructs this ApiParams without a postData JSONObject at all.
         result = await self.api.request("m.life.home.space.list", "1.0")
@@ -1504,6 +1675,78 @@ class PopurAccount:
     async def home_devices(self, home_id: int | str) -> tuple[AccountDevice, ...]:
         result = await self.api.request("m.life.my.group.device.list", "2.2", {"gid": home_id})
         return _parse_device_list(result, "home device list")
+
+    # ------------------------------------------------------------------
+    # Home management (``o00O0O`` — the app's ``HomeManager`` surface)
+    # ------------------------------------------------------------------
+
+    async def create_home(
+        self,
+        name: str,
+        *,
+        lon: float = 0.0,
+        lat: float = 0.0,
+        geo_name: str = "",
+        rooms: Sequence[str] | None = None,
+    ) -> Any:
+        """``m.life.group.location.add`` v6.0 — the app's
+        ``IThingHomeManager.createHome`` (``{name, lat, lon, rooms,
+        geoName}``)."""
+        return await self.api.request(
+            "m.life.group.location.add",
+            "6.0",
+            {
+                "name": name,
+                "lat": lat,
+                "lon": lon,
+                "rooms": list(rooms or ()),
+                "geoName": geo_name,
+            },
+        )
+
+    async def update_home(
+        self,
+        home_id: int | str,
+        *,
+        name: str | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+        geo_name: str | None = None,
+    ) -> Any:
+        """``thing.m.location.update`` v2.0 — rename/re-geo a home
+        (``{gid, name, lat, lon, geoName}``)."""
+        post_data: dict[str, Any] = {"gid": home_id}
+        if name is not None:
+            post_data["name"] = name
+        if lat is not None:
+            post_data["lat"] = lat
+        if lon is not None:
+            post_data["lon"] = lon
+        if geo_name is not None:
+            post_data["geoName"] = geo_name
+        return await self.api.request("thing.m.location.update", "2.0", post_data)
+
+    async def dismiss_home(self, home_id: int | str) -> Any:
+        """``thing.m.location.dismiss`` v2.0 — delete a home
+        (``{gid}``)."""
+        return await self.api.request(
+            "thing.m.location.dismiss", "2.0", {"gid": home_id}
+        )
+
+    async def sort_homes(self, ids: str | Sequence[int | str]) -> Any:
+        """``thing.m.location.sort`` v1.0 — reorder homes (``{ids}``
+        gid list)."""
+        value = ids if isinstance(ids, str) else ",".join(str(i) for i in ids)
+        return await self.api.request("thing.m.location.sort", "1.0", {"ids": value})
+
+    async def add_home_member(self, invitation_code: str) -> Any:
+        """``thing.m.group.invitation.member.add`` v1.0 — join a home
+        by invitation code (``{invitationCode}``)."""
+        return await self.api.request(
+            "thing.m.group.invitation.member.add",
+            "1.0",
+            {"invitationCode": invitation_code},
+        )
 
     async def batch_invoke(
         self,
@@ -1829,6 +2072,31 @@ class PopurAccount:
         )
         return None if result is None else str(result)
 
+    async def device_day_stats(
+        self,
+        device_id: str,
+        *,
+        dp_id: int,
+        stat_type: str = "sum",
+        start_day: str,
+        end_day: str,
+        auto: int | None = None,
+    ) -> Any:
+        """``tuya.m.dp.rang.stat.day.list`` v2.0 — per-day DP statistics,
+        the endpoint the app's stats UI actually calls
+        (``TuyaApiHelper.queryDeviceDayStatistics``). Days are
+        ``YYYYMMDD``; ``{devId, dpId, type, startDay, endDay[, auto]}``."""
+        post_data: dict[str, Any] = {
+            "devId": device_id,
+            "dpId": dp_id,
+            "type": stat_type,
+            "startDay": start_day,
+            "endDay": end_day,
+        }
+        if auto is not None:
+            post_data["auto"] = auto
+        return await self.api.request("tuya.m.dp.rang.stat.day.list", "2.0", post_data)
+
     # ------------------------------------------------------------------
     # Household pets — Popur ``feature/pet`` (``PetRemoteDataSource``)
     # ------------------------------------------------------------------
@@ -1884,6 +2152,30 @@ class PopurAccount:
             },
         )
         return PetRecordPage.from_json(result or {})
+
+    async def pet_breeds(self, pet_type: str = PET_TYPE_CAT) -> Any:
+        """``tuya.m.petuser.breed.list`` v1.0 — the breed catalogue the
+        pet-profile editor lists (``{petType}``)."""
+        return await self.api.request(
+            "tuya.m.petuser.breed.list", "1.0", {"petType": pet_type}
+        )
+
+    async def storage_upload_sign(
+        self, upload_file_name: str, *, biz: str = "pet"
+    ) -> Any:
+        """``tuya.m.storage.upload.sign`` v3.0 — the signed-URL grant
+        the app fetches before PUT-ing a pet avatar
+        (``{uploadFileName, type:"image", method:"PUT", biz}``)."""
+        return await self.api.request(
+            "tuya.m.storage.upload.sign",
+            "3.0",
+            {
+                "uploadFileName": upload_file_name,
+                "type": "image",
+                "method": "PUT",
+                "biz": biz,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Device management (``dbppbbp`` / ``bqqbpqb`` / ``bdbbqbd``)

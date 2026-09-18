@@ -282,6 +282,189 @@ class DeviceManagementTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class AuthMethodTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_email_code(self) -> None:
+        account, api = _account(True)
+        await account.send_email_code("a@b.c", country_code="1")
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("thing.m.user.email.code.send", "1.0"))
+        self.assertEqual(post, {"countryCode": "1", "email": "a@b.c"})
+        self.assertFalse(api.last_call["kwargs"]["session_required"])
+
+    async def test_verify_email_code(self) -> None:
+        account, api = _account(True)
+        await account.verify_email_code("a@b.c", "123456", code_type=2, server="AY")
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("thing.m.user.username.code.verify", "1.0"))
+        self.assertEqual(post["username"], "a@b.c")
+        self.assertEqual(post["code"], "123456")
+        self.assertEqual(post["codeType"], 2)
+        self.assertEqual(post["server"], "AY")
+
+    async def test_login_with_email_code(self) -> None:
+        api = _StubApi({"sid": "s1", "ecode": "e1", "uid": "u1",
+                        "partnerIdentity": "p1", "domain": {}})
+        account = PopurAccount(api)  # type: ignore[arg-type]
+        session = await account.login_with_email_code("a@b.c", "123456")
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("thing.m.user.email.code.login", "3.0"))
+        self.assertEqual(post["code"], "123456")
+        self.assertFalse(api.last_call["kwargs"]["session_required"])
+        self.assertTrue(api.last_call["kwargs"]["encrypted"])
+        self.assertEqual(session.uid, "u1")
+        self.assertIs(api.session, session)
+
+    async def test_register_email(self) -> None:
+        api = _StubApi(True)
+        account = PopurAccount(api)  # type: ignore[arg-type]
+        token = {"token": "tok1", "publicKey": "0", "exponent": "0"}
+
+        async def fake_token(email: str, cc: str) -> dict:
+            return token
+
+        account._login_token = fake_token  # type: ignore[method-assign]
+        with unittest.mock.patch(
+            "pypopur.mobile._rsa_encrypt_password", return_value="enc-pw"
+        ):
+            await account.register_email("a@b.c", "pw")
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("thing.m.user.email.register", "1.0"))
+        self.assertEqual(post["email"], "a@b.c")
+        self.assertEqual(post["token"], "tok1")
+        self.assertEqual(post["ifencrypt"], 1)
+        self.assertEqual(post["options"], '{"group": 1}')
+        self.assertTrue(api.last_call["kwargs"]["encrypted"])
+
+    async def test_reset_email_password(self) -> None:
+        account, api = _account(True)
+        await account.reset_email_password("a@b.c", "999", "newpw")
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("thing.m.user.email.password.reset", "1.0"))
+        self.assertEqual(post["emailCode"], "999")
+        self.assertEqual(len(post["newPasswd"]), 32)
+
+    async def test_logout_clears_session(self) -> None:
+        account, api = _account(True)
+        api.session = type("S", (), {"uid": "u1"})()
+        await account.logout()
+        self.assertEqual(api.last_call["args"][0], "thing.m.user.loginout")
+        self.assertEqual(api.last_call["args"][2], {"uniqueKey": "u1"})
+        self.assertIsNone(api.session)
+
+    async def test_cancel_account(self) -> None:
+        account, api = _account(True)
+        api.session = type("S", (), {"uid": "u1"})()
+        await account.cancel_account()
+        self.assertEqual(api.last_call["args"][0], "thing.m.user.apply.logout")
+        self.assertIsNone(api.session)
+
+    async def test_update_user(self) -> None:
+        account, api = _account(True)
+        await account.update_user(nickname="Nick", avatar="a.png")
+        self.assertEqual(
+            api.last_call["args"],
+            ("thing.m.user.update", "3.3", {"nickname": "Nick", "avatar": "a.png"}),
+        )
+
+    async def test_set_temp_unit(self) -> None:
+        account, api = _account(True)
+        await account.set_temp_unit(1)
+        self.assertEqual(
+            api.last_call["args"],
+            ("thing.m.user.unit.temp.update", "2.0", {"tempUnit": 1}),
+        )
+
+    async def test_update_user_timezone(self) -> None:
+        account, api = _account(True)
+        await account.update_user_timezone("America/Los_Angeles")
+        self.assertEqual(
+            api.last_call["args"],
+            ("thing.m.user.timezone.update", "1.0",
+             {"timezoneId": "America/Los_Angeles"}),
+        )
+
+
+class HomeManagementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_create_home(self) -> None:
+        account, api = _account({"gid": 1})
+        await account.create_home("Home", lon=-122.4, lat=37.7,
+                                  geo_name="SF", rooms=["r1", "r2"])
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("m.life.group.location.add", "6.0"))
+        self.assertEqual(post["name"], "Home")
+        self.assertEqual(post["lon"], -122.4)
+        self.assertEqual(post["lat"], 37.7)
+        self.assertEqual(post["geoName"], "SF")
+        self.assertEqual(post["rooms"], ["r1", "r2"])
+
+    async def test_update_home(self) -> None:
+        account, api = _account(True)
+        await account.update_home(7, name="Renamed")
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("thing.m.location.update", "2.0"))
+        self.assertEqual(post, {"gid": 7, "name": "Renamed"})
+
+    async def test_dismiss_home(self) -> None:
+        account, api = _account(True)
+        await account.dismiss_home(7)
+        self.assertEqual(
+            api.last_call["args"],
+            ("thing.m.location.dismiss", "2.0", {"gid": 7}),
+        )
+
+    async def test_sort_homes(self) -> None:
+        account, api = _account(True)
+        await account.sort_homes([3, 1, 7])
+        self.assertEqual(
+            api.last_call["args"],
+            ("thing.m.location.sort", "1.0", {"ids": "3,1,7"}),
+        )
+
+    async def test_add_home_member(self) -> None:
+        account, api = _account(True)
+        await account.add_home_member("ABC123")
+        self.assertEqual(
+            api.last_call["args"],
+            ("thing.m.group.invitation.member.add", "1.0",
+             {"invitationCode": "ABC123"}),
+        )
+
+
+class StatsAndBreedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_device_day_stats(self) -> None:
+        account, api = _account([])
+        await account.device_day_stats(
+            "dev1", dp_id=114, stat_type="sum",
+            start_day="20260901", end_day="20260918",
+        )
+        action, version, post = api.last_call["args"]
+        self.assertEqual((action, version), ("tuya.m.dp.rang.stat.day.list", "2.0"))
+        self.assertEqual(post["devId"], "dev1")
+        self.assertEqual(post["dpId"], 114)
+        self.assertEqual(post["type"], "sum")
+        self.assertEqual(post["startDay"], "20260901")
+        self.assertEqual(post["endDay"], "20260918")
+        self.assertNotIn("auto", post)
+
+    async def test_pet_breeds(self) -> None:
+        account, api = _account([{"breedCode": "c1", "breedName": "Hybrid"}])
+        await account.pet_breeds()
+        self.assertEqual(
+            api.last_call["args"],
+            ("tuya.m.petuser.breed.list", "1.0", {"petType": "cat"}),
+        )
+
+    async def test_storage_upload_sign(self) -> None:
+        account, api = _account({"url": "https://x"})
+        await account.storage_upload_sign("a.png")
+        self.assertEqual(
+            api.last_call["args"],
+            ("tuya.m.storage.upload.sign", "3.0",
+             {"uploadFileName": "a.png", "type": "image",
+              "method": "PUT", "biz": "pet"}),
+        )
+
+
 class TimerTests(unittest.IsolatedAsyncioTestCase):
     async def test_timers_uses_verified_v1(self) -> None:
         account, api = _account([])
