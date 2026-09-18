@@ -42,12 +42,21 @@ from .reads import (
     DatapointStat,
     FirmwareModule,
     OperateLog,
+    Pet,
+    PetRecordPage,
     TimerGroup,
     TimezoneInfo,
 )
 from .reference import S7_PRODUCT_IDS
 from .sdk.dedup import ThingMessageCache
 from .sdk.thing_model import ThingSmartThingModel
+from .writes import (
+    PET_TYPE_CAT,
+    TimerInstruction,
+    build_instruct,
+    pet_json,
+    pet_query_json,
+)
 
 POPUR_APP2_PACKAGE_NAME: Final = "com.smartapp.popur.app"
 POPUR_APP2_APP_VERSION: Final = "2.0.0"
@@ -1746,8 +1755,10 @@ class PopurAccount:
     async def timers(
         self, device_id: str, *, home_id: int | str | None = None
     ) -> tuple[TimerGroup, ...]:
-        """``thing.m.timer.all.list`` — scheduled timers grouped by
-        category (empty when the device has none)."""
+        """``thing.m.timer.all.list`` v1.0 — scheduled timers grouped by
+        category (empty when the device has none). The app's v2.0
+        ``bizId`` path is rejected by the live service
+        (``PARAM_ALL_INPUT_LOSS``); v1.0 ``{devId}`` is verified."""
 
         result = await self.api.request(
             "thing.m.timer.all.list", "1.0", {"devId": device_id}, gid=home_id
@@ -1817,6 +1828,342 @@ class PopurAccount:
             },
         )
         return None if result is None else str(result)
+
+    # ------------------------------------------------------------------
+    # Household pets — Popur ``feature/pet`` (``PetRemoteDataSource``)
+    # ------------------------------------------------------------------
+
+    async def pets(self, home_id: int | str) -> tuple[Pet, ...]:
+        """``m.ha.pet.group.list`` v1.0 — the household's pet profiles.
+
+        ``home_id`` is the home gid; the app sends it as ``ownerId``
+        inside a ``queryJson`` string with ``bizTypes: [1]``."""
+
+        result = await self.api.request(
+            "m.ha.pet.group.list",
+            "1.0",
+            {"queryJson": pet_query_json(home_id)},
+        )
+        if result is None:
+            return ()
+        if not isinstance(result, list):
+            raise ProtocolError("pet list response was not an array")
+        return tuple(
+            Pet.from_json(_require_mapping(item, "pet")) for item in result
+        )
+
+    async def pet_records(
+        self,
+        home_id: int | str,
+        *,
+        pet_id: int | None = None,
+        log_type: int | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        page_no: int = 1,
+        page_size: int = 20,
+    ) -> PetRecordPage:
+        """``m.ha.pet.record.list`` v1.0 — per-pet usage/weight records.
+
+        Times are epoch millis; the app always sends ``pageNo``/
+        ``pageSize`` inside the ``queryJson`` string."""
+
+        result = await self.api.request(
+            "m.ha.pet.record.list",
+            "1.0",
+            {
+                "queryJson": pet_query_json(
+                    home_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    log_type=log_type,
+                    pet_id=pet_id,
+                    page_no=page_no,
+                    page_size=page_size,
+                )
+            },
+        )
+        return PetRecordPage.from_json(result or {})
+
+    # ------------------------------------------------------------------
+    # Device management (``dbppbbp`` / ``bqqbpqb`` / ``bdbbqbd``)
+    # ------------------------------------------------------------------
+
+    async def rename_device(self, device_id: str, name: str) -> Any:
+        """``thing.m.device.name.update`` v1.0 — rename a device."""
+        return await self.api.request(
+            "thing.m.device.name.update", "1.0", {"devId": device_id, "name": name}
+        )
+
+    async def update_device(
+        self, device_id: str, *, name: str | None = None, icon: str | None = None
+    ) -> Any:
+        """``thing.m.device.update`` v1.3.1 — update name and/or icon
+        (``dbppbbp`` puts ``devId``/``icon``/``name``)."""
+        post_data: dict[str, Any] = {"devId": device_id}
+        if icon is not None:
+            post_data["icon"] = icon
+        if name is not None:
+            post_data["name"] = name
+        return await self.api.request("thing.m.device.update", "1.3.1", post_data)
+
+    async def remove_device(self, device_id: str) -> Any:
+        """``thing.m.app.smart.local.device.remove`` v1.0 — unbind the
+        device from the account (``{deviceId}``, session required)."""
+        return await self.api.request(
+            "thing.m.app.smart.local.device.remove", "1.0", {"deviceId": device_id}
+        )
+
+    async def confirm_firmware_upgrade(self, device_id: str, upgrade_type: int) -> Any:
+        """``thing.m.device.upgrade.confirm`` v3.0 — trigger an OTA for
+        one firmware module (``type`` = the module id from
+        :meth:`firmware_info`)."""
+        return await self.api.request(
+            "thing.m.device.upgrade.confirm",
+            "3.0",
+            {"devId": device_id, "type": upgrade_type},
+        )
+
+    async def cancel_firmware_upgrade(self, device_id: str, upgrade_type: int) -> Any:
+        """``thing.m.device.upgrade.cancel`` v1.0 — cancel an in-flight
+        OTA (``{devId, type}``)."""
+        return await self.api.request(
+            "thing.m.device.upgrade.cancel",
+            "1.0",
+            {"devId": device_id, "type": upgrade_type},
+        )
+
+    async def auto_upgrade_switch(self, device_id: str) -> Any:
+        """``thing.m.device.upgrade.auto.switch.get`` v1.0 — read the
+        auto-upgrade toggle."""
+        return await self.api.request(
+            "thing.m.device.upgrade.auto.switch.get", "1.0", {"devId": device_id}
+        )
+
+    async def set_auto_upgrade(self, device_id: str, value: int) -> Any:
+        """``thing.m.device.upgrade.auto.switch.save`` v1.0 — set the
+        auto-upgrade toggle (``{devId, value}``)."""
+        return await self.api.request(
+            "thing.m.device.upgrade.auto.switch.save",
+            "1.0",
+            {"devId": device_id, "value": value},
+        )
+
+    # ------------------------------------------------------------------
+    # Cloud timers (``bqbdpqd``) — distinct from the S7's DP schedules
+    # ------------------------------------------------------------------
+
+    async def timer_categories(self, device_id: str) -> Any:
+        """``thing.m.timer.category.list`` v1.0 — timer categories with
+        their enabled state (``{devId}`` → ``CategoryStatusBean[]``)."""
+        return await self.api.request(
+            "thing.m.timer.category.list", "1.0", {"devId": device_id}
+        )
+
+    async def timer_groups(
+        self, device_id: str, *, category: str, timer_type: str = "timer"
+    ) -> Any:
+        """``thing.m.timer.group.list`` v2.0 — timer groups in one
+        category. ``bizId`` is the devId."""
+        return await self.api.request(
+            "thing.m.timer.group.list",
+            "2.0",
+            {"bizId": device_id, "category": category, "type": timer_type},
+        )
+
+    async def add_timer_group(
+        self,
+        *,
+        category: str,
+        loops: str,
+        time_zone: str,
+        timer_type: str = "timer",
+        instruct: str | Sequence[TimerInstruction | Mapping[str, Any]],
+    ) -> Any:
+        """``thing.m.timer.group.add`` v3.0 — create a timer group
+        (``{category, loops, timeZone, type, instruct}``). Pass
+        ``instruct`` as the app's JSON-array string or a sequence of
+        :class:`TimerInstruction`."""
+        return await self.api.request(
+            "thing.m.timer.group.add",
+            "3.0",
+            {
+                "category": category,
+                "loops": loops,
+                "timeZone": time_zone,
+                "type": timer_type,
+                "instruct": instruct
+                if isinstance(instruct, str)
+                else build_instruct(instruct),
+            },
+        )
+
+    async def update_timer_group(
+        self,
+        group_id: str,
+        *,
+        category: str,
+        loops: str,
+        time_zone: str,
+        timer_type: str = "timer",
+        instruct: str | Sequence[TimerInstruction | Mapping[str, Any]],
+    ) -> Any:
+        """``thing.m.timer.group.update`` v3.0 — replace a timer
+        group's schedule (``{groupId, category, loops, timeZone,
+        type, instruct}``)."""
+        return await self.api.request(
+            "thing.m.timer.group.update",
+            "3.0",
+            {
+                "groupId": group_id,
+                "category": category,
+                "loops": loops,
+                "timeZone": time_zone,
+                "type": timer_type,
+                "instruct": instruct
+                if isinstance(instruct, str)
+                else build_instruct(instruct),
+            },
+        )
+
+    async def remove_timer_group(
+        self, group_id: str, *, category: str, timer_type: str = "timer"
+    ) -> Any:
+        """``thing.m.timer.group.remove`` v2.0 — delete a timer group
+        (``{category, groupId, type}``)."""
+        return await self.api.request(
+            "thing.m.timer.group.remove",
+            "2.0",
+            {"category": category, "groupId": group_id, "type": timer_type},
+        )
+
+    async def set_timer_group_status(
+        self,
+        group_id: str,
+        *,
+        category: str,
+        status: int,
+        timer_type: str = "timer",
+    ) -> Any:
+        """``thing.m.timer.group.status.update`` v2.0 — enable/disable
+        a timer group (``{groupId, category, status, type}``)."""
+        return await self.api.request(
+            "thing.m.timer.group.status.update",
+            "2.0",
+            {
+                "groupId": group_id,
+                "category": category,
+                "status": status,
+                "type": timer_type,
+            },
+        )
+
+    async def set_timer_category_status(
+        self,
+        device_id: str,
+        *,
+        category: str,
+        status: int,
+        timer_type: str = "timer",
+    ) -> Any:
+        """``thing.m.timer.category.status.update`` v1.0 — enable/disable
+        a whole timer category (``{devId, category, status, type}``)."""
+        return await self.api.request(
+            "thing.m.timer.category.status.update",
+            "1.0",
+            {
+                "devId": device_id,
+                "category": category,
+                "status": status,
+                "type": timer_type,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Pet management writes (``PetRemoteDataSource.a`` / ``.g``)
+    # ------------------------------------------------------------------
+
+    async def add_pet(
+        self,
+        home_id: int | str,
+        name: str,
+        *,
+        pet_type: str = PET_TYPE_CAT,
+        avatar: str | None = None,
+        sex: int | None = None,
+        birth: int | None = None,
+        weight: int | None = None,
+        breed_code: str | None = None,
+        ext_info: str | None = None,
+    ) -> Any:
+        """``m.ha.pet.group.add`` v1.0 — add a pet profile. Fields ride
+        inside the ``petJson`` string (``bizType`` is always 1)."""
+        return await self.api.request(
+            "m.ha.pet.group.add",
+            "1.0",
+            {
+                "petJson": pet_json(
+                    home_id,
+                    name,
+                    pet_type=pet_type,
+                    avatar=avatar,
+                    sex=sex,
+                    birth=birth,
+                    weight=weight,
+                    breed_code=breed_code,
+                    ext_info=ext_info,
+                )
+            },
+        )
+
+    async def update_pet(
+        self,
+        home_id: int | str,
+        pet_id: int,
+        *,
+        name: str | None = None,
+        avatar: str | None = None,
+        sex: int | None = None,
+        birth: int | None = None,
+        weight: int | None = None,
+        breed_code: str | None = None,
+        ext_info: str | None = None,
+        activeness: int | None = None,
+    ) -> Any:
+        """``m.ha.pet.group.update`` v1.0 — update a pet profile
+        (``petJson`` carries ``id`` plus the changed fields)."""
+        return await self.api.request(
+            "m.ha.pet.group.update",
+            "1.0",
+            {
+                "petJson": pet_json(
+                    home_id,
+                    name,
+                    pet_id=pet_id,
+                    avatar=avatar,
+                    sex=sex,
+                    birth=birth,
+                    weight=weight,
+                    breed_code=breed_code,
+                    ext_info=ext_info,
+                    activeness=activeness,
+                )
+            },
+        )
+
+    async def delete_pet(self, home_id: int | str, pet_id: int) -> Any:
+        """Delete a pet via ``m.ha.pet.group.update`` — the app's
+        ``DeletePetRequest(petId, ownerId)`` flows through the update
+        endpoint with ``activeness: 0``."""
+        return await self.api.request(
+            "m.ha.pet.group.update",
+            "1.0",
+            {
+                "petJson": pet_json(
+                    home_id, pet_id=pet_id, activeness=0
+                )
+            },
+        )
 
     def connect_events(
         self,

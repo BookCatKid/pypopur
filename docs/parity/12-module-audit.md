@@ -21,10 +21,11 @@ neutral), **fix** (right shape, wrong/incomplete semantics), **rewrite**
 | `discovery.py` | done | rewritten on `sdk/discovery.py` + real UDP socket stack |
 | `local.py` | done | rewritten on real 0x55aa/session-key `sdk/lan_*` stack |
 | `cloud.py` | done | `CloudChannelBackend`: MQTT-first / HTTP-fallback / 10203 |
-| `mobile.py` | done | crypto/sign/login verified; batch bootstrap + retry/session/region added; typed read surface (`thing_model`, `device_events`, `firmware_info`, `device_meta`, `biz_props`, `device_timezone`, `timers`, `datapoint_stats`, `datapoint_stat_rank`) + `connect_events` |
+| `mobile.py` | done | crypto/sign/login verified; batch bootstrap + retry/session/region added; typed read surface (`thing_model`, `device_events`, `firmware_info`, `device_meta`, `biz_props`, `device_timezone`, `timers`, `datapoint_stats`, `datapoint_stat_rank`, `pets`, `pet_records`, `timer_categories`, `timer_groups`, `auto_upgrade_switch`) + management writes (`rename_device`, `update_device`, `remove_device`, `confirm/cancel_firmware_upgrade`, `set_auto_upgrade`, timer group CRUD, `add/update/delete_pet`) + `connect_events` |
 | `pipeline.py` | done | `PipelineTransport` composing LAN + cloud via `ThingDevicePresenter` |
 | `events.py` | done | session→MQTT construction (`getMqttConfigInfo` token=sid, appTag="os"), `qqpqqpq` listener (topic suffixes, getLocalKey/isDataUpdated prefix strip), `CentralDpIngest` bridge |
-| `reads.py` | done | typed beans for `dbppbbp` read endpoints (operate log, upgrade info, timezone, timers, biz props, datapoint stats) |
+| `reads.py` | done | typed beans for `dbppbbp` read endpoints (operate log, upgrade info, timezone, timers, biz props, datapoint stats) plus `m.ha.pet.group.list`/`record.list` pets (`Pet`, `PetRecord`) |
+| `writes.py` | done | `petJson`/`queryJson` builders (`PetRemoteDataSource`), `TimerInstruction`/`instruct` — backs `PopurAccount` device mgmt (`thing.m.device.update` 1.3.1, `name.update`, `app.smart.local.device.remove`), OTA (`upgrade.confirm` 3.0/`cancel`/auto-switch), cloud timers (`bqbdpqd` add/update/remove/status/category), pet add/update/delete (`m.ha.pet.group.*`) |
 | `__init__.py` | done | re-exports updated during rebuild |
 
 ## Per-module detail

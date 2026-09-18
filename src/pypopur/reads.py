@@ -218,6 +218,120 @@ class BizProp:
 
 
 @dataclass(frozen=True, slots=True)
+class Pet:
+    """One ``m.ha.pet.group.list`` row — a household pet profile
+    (Popur ``feature/pet`` Pet model). ``owner_id`` is the home gid."""
+
+    pet_id: int | None
+    name: str
+    pet_type: str | None
+    breed_code: str | None
+    breed_name: str | None
+    sex: int | None
+    weight: int | None
+    birth: int | None
+    avatar: str | None
+    ext_info: str | None
+    owner_id: str | None
+    activeness: int | None
+    gmt_create: int | None
+    gmt_modified: int | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_json(cls, obj: Mapping[str, Any]) -> Pet:
+        return cls(
+            pet_id=_int_or_none(obj.get("id")),
+            name=_str_or_none(obj.get("name")) or "",
+            pet_type=_str_or_none(obj.get("petType")),
+            breed_code=_str_or_none(obj.get("breedCode")),
+            breed_name=_str_or_none(obj.get("breedName")),
+            sex=_int_or_none(obj.get("sex")),
+            weight=_int_or_none(obj.get("weight")),
+            birth=_int_or_none(obj.get("birth")),
+            avatar=_str_or_none(obj.get("avatar")),
+            ext_info=_str_or_none(obj.get("extInfo")),
+            owner_id=_str_or_none(obj.get("ownerId")),
+            activeness=_int_or_none(obj.get("activeness")),
+            gmt_create=_int_or_none(obj.get("gmtCreate")),
+            gmt_modified=_int_or_none(obj.get("gmtModified")),
+            raw=dict(obj),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PetRecord:
+    """One ``m.ha.pet.record.list`` row — a per-pet usage/weight log.
+
+    Live shape: ``{devId, dpCode, logType, matchRspVO, time, value}``
+    where ``matchRspVO`` is the server's pet match (``{id,
+    matchOnPetInfoChange, matchReason}``) and ``value`` is the raw
+    base64 DP payload for ``dpCode`` (e.g. ``toilet_usage_data``)."""
+
+    record_id: str | None
+    dev_id: str | None
+    dp_code: str | None
+    log_type: str | None
+    pet_id: int | None
+    match_reason: str | None
+    record_time: int | None
+    value: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_json(cls, obj: Mapping[str, Any]) -> PetRecord:
+        match = obj.get("matchRspVO")
+        match_map = match if isinstance(match, Mapping) else {}
+        return cls(
+            record_id=_str_or_none(obj.get("id")),
+            dev_id=_str_or_none(obj.get("devId")),
+            dp_code=_str_or_none(obj.get("dpCode")),
+            log_type=_str_or_none(obj.get("logType")),
+            pet_id=_int_or_none(obj.get("petId", match_map.get("id"))),
+            match_reason=_str_or_none(match_map.get("matchReason")),
+            record_time=_int_or_none(
+                obj.get("recordTime", obj.get("time", obj.get("gmtCreate")))
+            ),
+            value=_str_or_none(obj.get("value", obj.get("content"))),
+            raw=dict(obj),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PetRecordPage:
+    """``m.ha.pet.record.list`` result — a page of pet records. The
+    service shape is paged; ``records`` collects whichever list key
+    the response carries."""
+
+    records: tuple[PetRecord, ...]
+    total: int | None
+    has_next: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_json(cls, obj: Any) -> PetRecordPage:
+        rows: Any = obj
+        total: int | None = None
+        has_next = False
+        if isinstance(obj, Mapping):
+            total = _int_or_none(obj.get("total"))
+            has_next = bool(obj.get("hasNext"))
+            rows = next(
+                (
+                    obj[key]
+                    for key in ("list", "records", "dps", "data")
+                    if isinstance(obj.get(key), list)
+                ),
+                (),
+            )
+        records = tuple(
+            PetRecord.from_json(row) for row in rows if isinstance(row, Mapping)
+        ) if isinstance(rows, list) else ()
+        return cls(records=records, total=total, has_next=has_next,
+                   raw=dict(obj) if isinstance(obj, Mapping) else {"list": rows})
+
+
+@dataclass(frozen=True, slots=True)
 class DatapointStat:
     """``m.smart.datapoint.stat`` (``DataPointStatBean``) — aggregated
     per-period values plus the period total."""
@@ -244,7 +358,11 @@ __all__ = [
     "DatapointStat",
     "DstInterval",
     "FirmwareModule",
+    "OperateLog",
     "OperateLogEntry",
+    "Pet",
+    "PetRecord",
+    "PetRecordPage",
     "ThingSmartThingModel",
     "TimerGroup",
     "TimerItem",

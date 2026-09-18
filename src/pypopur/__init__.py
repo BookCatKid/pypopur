@@ -125,6 +125,9 @@ from .reads import (
     FirmwareModule,
     OperateLog,
     OperateLogEntry,
+    Pet,
+    PetRecord,
+    PetRecordPage,
     TimerGroup,
     TimerItem,
     TimezoneInfo,
@@ -145,6 +148,7 @@ from .reference import (
     wire_status,
 )
 from .transport import PopurTransport
+from .writes import TimerInstruction, build_instruct, pet_json, pet_query_json
 
 __all__ = [
     "DP_ALIASES",
@@ -208,6 +212,9 @@ __all__ = [
     "OperateLog",
     "OperateLogEntry",
     "PanelToggles",
+    "Pet",
+    "PetRecord",
+    "PetRecordPage",
     "PipelineTransport",
     "PopurAccount",
     "PopurClient",
@@ -227,6 +234,7 @@ __all__ = [
     "ThingMobileApi",
     "TimePowerSettings",
     "TimerGroup",
+    "TimerInstruction",
     "TimerItem",
     "TimerSlice",
     "TimezoneInfo",
@@ -240,6 +248,7 @@ __all__ = [
     "bootstrap_discovered_s7_popur_app2",
     "build_business",
     "build_device_api",
+    "build_instruct",
     "canonical_sign_input",
     "decode_dp22",
     "decode_dp101",
@@ -273,6 +282,8 @@ __all__ = [
     "mobile_response_signature",
     "normalize_certificate_sha256",
     "parse_scan_results",
+    "pet_json",
+    "pet_query_json",
     "recurrence_mask_to_text",
     "recurrence_text_to_mask",
     "resolve_local_config",
