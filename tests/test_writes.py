@@ -8,7 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 from pypopur.mobile import PopurAccount
-from pypopur.reads import Pet, PetRecordPage
+from pypopur.reads import Pet, PetRecord, PetRecordPage
 from pypopur.writes import (
     TimerInstruction,
     build_instruct,
@@ -463,6 +463,40 @@ class StatsAndBreedTests(unittest.IsolatedAsyncioTestCase):
              {"uploadFileName": "a.png", "type": "image",
               "method": "PUT", "biz": "pet"}),
         )
+
+
+class ToiletUsageTests(unittest.TestCase):
+    def _record(self, value: str, dp_code: str = "toilet_usage_data") -> PetRecord:
+        return PetRecord.from_json({"dpCode": dp_code, "value": value})
+
+    def test_base64_value(self) -> None:
+        # Live payload: base64 of 02 16 2c 00 36 -> 5676 g, 54 s.
+        usage = self._record("AhYsADY=").toilet_usage()
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage.weight_grams, 5676)
+        self.assertEqual(usage.duration_seconds, 54)
+        self.assertEqual(usage.tag, 0x02)
+
+    def test_hex_value(self) -> None:
+        # The app expects a hex string: "0215F10084" -> 5617 g, 132 s.
+        usage = self._record("0215F10084").toilet_usage()
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage.weight_grams, 5617)
+        self.assertEqual(usage.duration_seconds, 132)
+
+    def test_dp_code_20(self) -> None:
+        usage = self._record("AhYsADY=", dp_code="20").toilet_usage()
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage.weight_grams, 5676)
+
+    def test_other_dp_code_returns_none(self) -> None:
+        self.assertIsNone(self._record("AhYsADY=", dp_code="x").toilet_usage())
+
+    def test_short_payload_returns_none(self) -> None:
+        self.assertIsNone(self._record("AAAA").toilet_usage())
+
+    def test_empty_value_returns_none(self) -> None:
+        self.assertIsNone(self._record("").toilet_usage())
 
 
 class TimerTests(unittest.IsolatedAsyncioTestCase):

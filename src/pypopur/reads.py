@@ -8,6 +8,8 @@ stay reachable.
 
 from __future__ import annotations
 
+import base64
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -296,6 +298,53 @@ class PetRecord:
             raw=dict(obj),
         )
 
+    def toilet_usage(self) -> ToiletUsage | None:
+        """Decode ``value`` for ``toilet_usage_data`` records — the
+        app's ``ToiletUsageDataKt`` parse (≥5 bytes, weight at [1:3],
+        duration at [3:5]). ``None`` for other dpCodes/short payloads."""
+        if self.dp_code not in ("toilet_usage_data", "20") or not self.value:
+            return None
+        data = _decode_record_value(self.value)
+        if data is None or len(data) < 5:
+            return None
+        return ToiletUsage(
+            weight_grams=(data[1] << 8) | data[2],
+            duration_seconds=(data[3] << 8) | data[4],
+            tag=data[0],
+            raw_bytes=data,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ToiletUsage:
+    """Decoded ``toilet_usage_data`` record payload — the app's
+    ``ToiletUsageDataKt`` layout. Byte 0 is a version tag (``0x02``),
+    bytes 1-2 are the measured weight in grams (u16 BE) and bytes 3-4
+    are the visit duration in seconds (u16 BE)."""
+
+    weight_grams: int
+    duration_seconds: int
+    tag: int
+    raw_bytes: bytes = field(repr=False)
+
+
+_HEX_RE = re.compile(r"^[0-9A-Fa-f]+$")
+
+
+def _decode_record_value(value: str) -> bytes | None:
+    """The app expects a hex string; the live service returns base64.
+    Accept both, mirroring ``ToiletUsageDataKt``'s hex path first."""
+    compact = re.sub(r"\s", "", value)
+    if compact and len(compact) % 2 == 0 and _HEX_RE.match(compact):
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            pass
+    try:
+        return base64.b64decode(compact, validate=True)
+    except ValueError:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class PetRecordPage:
@@ -367,4 +416,5 @@ __all__ = [
     "TimerGroup",
     "TimerItem",
     "TimezoneInfo",
+    "ToiletUsage",
 ]
