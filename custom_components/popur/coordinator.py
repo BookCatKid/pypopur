@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -79,6 +80,8 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         self._devices = devices or {}
         self._shadow_dps: dict[str, dict[int, Any]] = {}
         self._next_cloud_refresh = 0.0
+        self._record_fetch_task: asyncio.TimerHandle | None = None
+        self._record_fetch_attempt = 0
 
     def transport_state(self, dev_id: str) -> str:
         """Which channel last served this device: ``lan`` or ``cloud``."""
@@ -183,27 +186,69 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
             except Exception as err:  # noqa: BLE001 — shadow is best-effort
                 _LOGGER.debug("cloud shadow refresh failed for %s: %s", dev_id, err)
         try:
-            pets: dict[int, Pet] = {}
-            for pet in await self.account.pets(self.home_id):
-                pets[pet.pet_id] = pet
-            data.pets = pets
-            page = await self.account.pet_records(
-                self.home_id, page_size=PET_RECORDS_PAGE_SIZE
-            )
-            visits: dict[int, PetVisit] = {}
-            for record in page.records:
-                pet_id = record.pet_id
-                if pet_id is None or pet_id in visits:
-                    continue  # records are newest-first
-                usage = record.toilet_usage()
-                visits[pet_id] = PetVisit(
-                    record=record,
-                    weight_grams=usage.weight_grams if usage else None,
-                    duration_seconds=usage.duration_seconds if usage else None,
-                )
-            data.pet_visits = visits
+            await self._refresh_pet_data(data)
         except Exception as err:  # noqa: BLE001 — pets are auxiliary; never fail the refresh
             _LOGGER.debug("pet data refresh failed: %s", err)
+
+    async def _refresh_pet_data(self, data: PopurRuntimeData) -> None:
+        """Fetch latest pet profiles + records into ``data``."""
+
+        pets: dict[int, Pet] = {}
+        for pet in await self.account.pets(self.home_id):
+            pets[pet.pet_id] = pet
+        data.pets = pets
+        page = await self.account.pet_records(
+            self.home_id, page_size=PET_RECORDS_PAGE_SIZE
+        )
+        visits: dict[int, PetVisit] = {}
+        for record in page.records:
+            pet_id = record.pet_id
+            if pet_id is None or pet_id in visits:
+                continue  # records are newest-first
+            usage = record.toilet_usage()
+            visits[pet_id] = PetVisit(
+                record=record,
+                weight_grams=usage.weight_grams if usage else None,
+                duration_seconds=usage.duration_seconds if usage else None,
+            )
+        data.pet_visits = visits
+
+    def _schedule_record_fetch(self) -> None:
+        """Debounce + schedule a delayed record fetch after ``cat_left``."""
+
+        if self._record_fetch_task is not None:
+            self._record_fetch_task.cancel()
+        self._record_fetch_attempt = 0
+        self._record_fetch_task = self.hass.loop.call_later(
+            45, lambda: self.hass.async_create_task(self._fetch_pet_records())
+        )
+
+    async def _fetch_pet_records(self) -> None:
+        """Fetch records ~45 s after cat_left; retry once if no new record."""
+
+        if self.data is None:
+            return
+        self._record_fetch_attempt += 1
+        old_latest = max(
+            (v.record.record_time or 0 for v in self.data.pet_visits.values()),
+            default=0,
+        )
+        try:
+            await self._refresh_pet_data(self.data)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("delayed pet record fetch failed: %s", err)
+            return
+        new_latest = max(
+            (v.record.record_time or 0 for v in self.data.pet_visits.values()),
+            default=0,
+        )
+        if new_latest <= old_latest and self._record_fetch_attempt < 2:
+            # Record hasn't landed in the cloud yet — retry once.
+            self._record_fetch_task = self.hass.loop.call_later(
+                45, lambda: self.hass.async_create_task(self._fetch_pet_records())
+            )
+            return
+        self.async_set_updated_data(self.data)
 
     def request_refresh(self) -> None:
         """Thread-safe refresh trigger (MQTT (re)connect resync)."""
@@ -221,3 +266,8 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         merged.update(dps)
         self.data.snapshots[dev_id] = decode_snapshot(merged)
         self.async_set_updated_data(self.data)
+
+        # A cat just left — the record lands in the cloud shortly after.
+        # Fetch it on a delay rather than waiting for the slow timer.
+        if 22 in dps and dps[22] == "cat_left":
+            self._schedule_record_fetch()
