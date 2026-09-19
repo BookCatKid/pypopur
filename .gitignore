@@ -9,3 +9,4 @@ htmlcov/
 .venv/
 dist/
 build/
+.DS_Store

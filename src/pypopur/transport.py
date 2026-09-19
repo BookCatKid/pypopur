@@ -84,13 +84,24 @@ class FallbackTransport(PopurTransport):
             return await self.fallback.read_dps(ids)
         try:
             result = await self.primary.read_dps(ids)
-            self.active = "primary"
-            return result
         except Exception as err:
             await self._mark_primary_dead(err)
             result = await self.fallback.read_dps(ids)
             self.active = "fallback"
             return result
+        self.active = "primary"
+        # The LAN query reply omits settings DPs (102/104/105); fill gaps
+        # from the fallback so read-modify-write callers see real values.
+        if ids:
+            missing = {i for i in ids if i not in result}
+            if missing:
+                try:
+                    extra = await self.fallback.read_dps(missing)
+                except Exception:
+                    extra = {}
+                if extra:
+                    result = {**result, **extra}
+        return result
 
     async def write_dps(self, values: Mapping[int, Any]) -> None:
         if time.monotonic() < self._primary_retry_at:

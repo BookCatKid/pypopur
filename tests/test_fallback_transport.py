@@ -11,8 +11,9 @@ from pypopur.transport import FallbackTransport, PopurTransport
 
 
 class _StubTransport(PopurTransport):
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, dps: dict | None = None) -> None:
         self.fail = fail
+        self.dps = dps
         self.reads = 0
         self.writes: list[dict] = []
         self.closed = 0
@@ -30,6 +31,8 @@ class _StubTransport(PopurTransport):
         self.reads += 1
         if self.fail:
             raise OSError("down")
+        if self.dps is not None:
+            return {i: v for i, v in self.dps.items() if ids is None or i in ids}
         return {1: "primary" if not self.writes else "w"}
 
     async def write_dps(self, values) -> None:
@@ -84,6 +87,31 @@ class FallbackTransportTests(unittest.TestCase):
         asyncio.run(t.read_dps())
         self.assertEqual(len(errors), 1)
         self.assertIs(t.last_error, errors[0])
+
+    def test_read_fills_missing_dps_from_fallback(self) -> None:
+        """The LAN reply omits settings DPs; requested-but-missing ids must
+        be filled from the fallback so read-modify-write sees real values."""
+        primary = _StubTransport(dps={1: "lan"})
+        fallback = _StubTransport(dps={102: "cloud"})
+        t = FallbackTransport(primary, fallback)
+        result = asyncio.run(t.read_dps({1, 102}))
+        # Primary answered with only {1}; fallback supplied the missing 102.
+        self.assertEqual(result, {1: "lan", 102: "cloud"})
+        self.assertEqual(fallback.reads, 1)
+        self.assertEqual(t.active, "primary")
+
+    def test_read_ignores_fallback_gaps(self) -> None:
+        primary, fallback = _StubTransport(), _StubTransport(fail=True)
+        t = FallbackTransport(primary, fallback)
+        result = asyncio.run(t.read_dps({1, 102}))
+        self.assertEqual(result, {1: "primary"})
+        self.assertEqual(t.active, "primary")
+
+    def test_read_all_skips_gap_fill(self) -> None:
+        primary, fallback = _StubTransport(), _StubTransport()
+        t = FallbackTransport(primary, fallback)
+        asyncio.run(t.read_dps())
+        self.assertEqual(fallback.reads, 0)
 
 
 class LanDiscoveryTests(unittest.TestCase):

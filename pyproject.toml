@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pypopur"
-version = "0.1.1"
+version = "0.1.2"
 description = "Async Python client for the Popur S7 smart litter box — LAN control, cloud APIs, MQTT events, and pet tracking"
 readme = "README.md"
 requires-python = ">=3.11"
