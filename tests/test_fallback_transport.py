@@ -138,6 +138,42 @@ class LanDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), ["192.168.1.99"])
 
+    def test_local_ip_falls_back_when_broadcast_refused(self) -> None:
+        """Linux raises EACCES on a UDP connect to 255.255.255.255 without
+        SO_BROADCAST — the HA container hits this; the unicast probe must
+        still resolve the outbound interface."""
+
+        import errno
+
+        from pypopur.discovery import _local_ip
+
+        class FakeSock:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, int]] = []
+
+            def setsockopt(self, *a) -> None:
+                pass
+
+            def connect(self, target) -> None:
+                self.calls.append(target)
+                if target[0] == "255.255.255.255":
+                    raise OSError(errno.EACCES, "Permission denied")
+
+            def getsockname(self):
+                return ("192.168.1.50", 0)
+
+            def close(self) -> None:
+                pass
+
+        fake = FakeSock()
+        with mock.patch(
+            "pypopur.discovery.socket.socket", return_value=fake
+        ):
+            self.assertEqual(_local_ip(), "192.168.1.50")
+        self.assertEqual(
+            fake.calls, [("255.255.255.255", 7000), ("8.8.8.8", 80)]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 """Async local-first Popur S7 library for firmware 4.x/app-v2."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .bootstrap import LocalConfigBootstrap, resolve_local_config
 from .client import PopurClient

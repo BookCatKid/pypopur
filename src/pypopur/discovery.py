@@ -104,12 +104,20 @@ def hgw_beans_to_discovered(beans: list[HgwBean]) -> tuple[DiscoveredS7, ...]:
 
 
 def _local_ip() -> str | None:
-    """``WiFiUtil.getIpAddress`` — outbound-interface IPv4."""
+    """``WiFiUtil.getIpAddress`` — outbound-interface IPv4.
+
+    The app probes the broadcast address; Linux refuses a UDP connect to
+    255.255.255.255 without SO_BROADCAST, so fall back to a plain unicast
+    target — the routing answer is identical either way."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect(("255.255.255.255", 7000))
-        return sock.getsockname()[0]
-    except OSError:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for target in (("255.255.255.255", 7000), ("8.8.8.8", 80)):
+            try:
+                sock.connect(target)
+                return sock.getsockname()[0]
+            except OSError:
+                continue
         return None
     finally:
         sock.close()
