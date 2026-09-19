@@ -1,170 +1,152 @@
 # pypopur
 
-`pypopur` is an async, local-first Python client and protocol model for the Popur S7 running
-firmware 4.x with the app-v2 protocol family. It is built from static analysis of the official
-Popur S7 Android v2.0.0 APK.
+**Experimental** — a reverse-engineered Python client for the Popur S7 smart litter box, built from static analysis of the official Android app (v2.0.0 / ThingClips SDK). Tested against a single real device; expect rough edges.
 
-The useful split is simple:
+[![PyPI](https://img.shields.io/pypi/v/pypopur)](https://pypi.org/project/pypopur/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://github.com/BookCatKid/pypopur/actions/workflows/ci.yml/badge.svg)](https://github.com/BookCatKid/pypopur/actions/workflows/ci.yml)
 
-- all dedicated firmware-4 packed DP models found in the app are decoded and encoded;
-- local control uses a device ID, LAN address, and per-device Tuya `localKey`;
-- passive LAN discovery identifies the current S7 product family before authentication;
-- the App-2 Thing mobile account bootstrap is implemented as a separate async layer: two-stage
-  email/password login, session setup, home/device queries, and `localKey` retrieval;
-- the version-bound OEM app identity/security material is bundled from the distributed App-2 APK,
-  and the APK extractor can independently reconstruct and check it;
-- after bootstrap, normal operation can stay entirely local;
-- a cloud transport interface exists so a supported account backend can be added without changing
-  the client or DP model.
+## Features
 
-## Local client
+- **LAN control** — Tuya protocol 3.5 session-key negotiation, DP read/write over TCP:6668, auto-protocol probing (3.1–3.5), heartbeat keepalive, stale-session recovery
+- **Cloud APIs** — full ThingClips/Popur app surface: auth, homes, devices, DP shadow, pets, pet records, firmware, timers, device management
+- **MQTT events** — real-time DP deltas and alert events over TLS to the app's broker, with reconnect/resubscribe handling
+- **Hybrid transport** — LAN-first with automatic cloud fallback; slow reconciliation tier for settings DPs and pet data the LAN omits
+- **Discovery** — passive UDP announcements plus active host location via ARP MAC match and port-6668 subnet scan
+- **DP codecs** — all firmware-4 packed payloads decoded (settings, calibration, radar config, cat weight, visit records)
+- **Pet tracking** — household pet profiles, per-visit weight/duration records decoded from the app's own format
+- **Home Assistant integration** — full entity coverage (sensors, switches, buttons, numbers, selects) in `custom_components/popur/`
 
-For local development, install the package from this source tree; TinyTuya is the LAN transport
-dependency. `pypopur` is not published to PyPI as part of this local-only work:
+## Install
 
-```fish
-python -m pip install .
+```bash
+pip install pypopur
 ```
 
-Then provide credentials for a device you own:
+Requires Python 3.11+.
+
+## Quick start — local control
 
 ```python
-from pypopur import PopurClient
+import asyncio
+from pypopur import LocalTuyaTransport, PopurClient
 
-client = PopurClient.local(
-    host="192.0.2.40",
-    device_id="your-device-id",
-    local_key="your-device-local-key",
+async def main():
+    transport = LocalTuyaTransport(
+        device_id="your-device-id",
+        host="192.168.1.x",
+        local_key="your-local-key",
+    )
+    client = PopurClient(transport)
+
+    async with client:
+        snapshot = await client.refresh()
+        print(snapshot.machine_status, snapshot.cat_present, snapshot.bin_full)
+        await client.start_cleaning()
+
+asyncio.run(main())
+```
+
+## Quick start — cloud account
+
+```python
+import asyncio
+from pypopur.mobile import MobileAppProfile, PopurAccount, ThingMobileApi
+
+async def main():
+    api = ThingMobileApi(
+        MobileAppProfile.bundled_popur_app2(),
+        install_id="a-stable-id-for-this-install",
+    )
+    account = PopurAccount(api)
+    await account.login("you@example.com", "your-password")
+
+    home_id = (await account.homes())[0]["gid"]
+    devices = await account.home_devices(home_id)
+
+    for dev in devices:
+        print(dev.name, dev.device_id, dev.local_key)
+
+asyncio.run(main())
+```
+
+## Quick start — pets
+
+```python
+pets = await account.pets(home_id)
+for pet in pets:
+    print(pet.name, pet.pet_type, pet.weight)
+
+page = await account.pet_records(home_id, page_size=50)
+for record in page.records:
+    usage = record.toilet_usage()
+    if usage:
+        print(record.pet_id, usage.weight_grams, "g", usage.duration_seconds, "s")
+```
+
+## Quick start — MQTT events
+
+```python
+events = account.connect_events(
+    devices={dev.device_id: dev.local_key},
+    on_event=lambda e: print(e.dev_id, e.dps),
+    on_connect=lambda: print("connected"),
 )
-
-async with client:
-    snapshot = await client.refresh()
-    print(snapshot.run_mode)
-    await client.start_cleaning()
+await events.connect()
 ```
 
-`protocol_version=None` is the default. The transport makes read-only status probes using 3.5,
-3.4, and then 3.3. The bundled Thing SDK contains 3.3, 3.4, 3.5, and a distinct 3.5.1 branch;
-TinyTuya's ordinary version API covers the first three. A passive LAN discovery of one real
-firmware-4 S7 observed protocol 3.5, while the fallback probes keep the client usable without
-assuming every firmware-4 unit negotiates the same version. Set an explicit version when known.
+## Architecture
 
-Local-key bootstrap is separate from the LAN transport. `discover_s7()` passively identifies an
-S7, and `PopurAccount.bootstrap_local_config()` resolves that discovered device through an
-authenticated Thing mobile session. The returned `LocalDeviceConfig` can then be used for LAN
-operation. Keys and account-session secrets are excluded from object `repr()` output.
-
-For the verified Popur App 2.0.0 APK, `MobileAppProfile.from_popur_app2_apk()` performs the native
-bootstrap locally. It reads the OEM app constants from the APK's DEX `BuildConfig`, extracts the
-APK v2/v3 signing certificate fingerprint, decodes the current-generation `assets/t_s.bmp`
-security component, derives `chKey`, and recreates the native request/encryption master.
-`MobileAppProfile.bundled_popur_app2()` provides the same version-bound app-shipped identity without
-requiring the APK at setup time. `MobileAppProfile.for_popur_app2()` remains available for callers
-that already have those inputs.
-
-A complete discovery-to-LAN bootstrap can therefore be written without manually copying a device
-ID, `localKey`, or OEM app values:
-
-```python
-from pypopur import bootstrap_discovered_s7_popur_app2, discover_s7
-
-devices = await discover_s7()
-config = await bootstrap_discovered_s7_popur_app2(
-    devices[0],
-    email="you@example.com",
-    password="your-popur-password",
-)
-
-# Store `config` securely; normal operation can now use PopurClient.local(...)
-# without keeping the Popur password or mobile session.
+```
+┌─────────────────────────────────────────────────┐
+│                  PopurClient                     │
+│         typed controls + DeviceSnapshot          │
+├─────────────────────────────────────────────────┤
+│              FallbackTransport                   │
+│   LAN primary (3.5) ──fail──► Cloud fallback    │
+├──────────┬──────────────────┬───────────────────┤
+│ LAN TCP  │  MQTT TLS        │  Cloud HTTPS      │
+│ :6668    │  smart/mb/in/    │  a1.tuyaus.com    │
+│ DP r/w   │  DP deltas       │  shadow, pets,    │
+│ ~23 DPs  │  alerts          │  mgmt APIs        │
+└──────────┴──────────────────┴───────────────────┘
 ```
 
-The current implementation mirrors the App-2 token/RSA password flow, native ATOP HMAC-SHA256
-signing, per-request HMAC key derivation, AES-GCM `et=3` envelope, SDK HTTP headers, encrypted
-response-signature verification, post-login regional API-host handoff, home/device enumeration,
-and `localKey` retrieval recovered from the APK. The request flow is covered by an offline
-synthetic server, and the APK-material derivation path is additionally smoke-tested locally against
-the inspected Popur APK. The complete read-only account path was also validated against the live
-US service with App 2.0.0 in September 2026: password login, home and device enumeration, device
-detail, and `localKey` retrieval all succeeded. A real account login is deliberately not part of
-the automated test suite.
+- **LAN** — fast path for reads/writes; ~23 DPs in status responses
+- **MQTT** — real-time push (protocol-4 deltas, protocol-56 alerts); deltas only, no snapshots
+- **Cloud** — settings DPs LAN omits (102 etc.), pet profiles/records, firmware, timers, device management
 
-The profile can also carry the ordinary Thing request metadata (`channel`, `deviceCoreVersion`,
-Android/system model, timezone, SDK level, brand, `bizData`, and other common parameters) instead
-of fabricating phone-specific values. `derive_android_device_id()` reproduces the SDK's persisted
-`PhoneUtil.getRemoteDeviceID()` calculation when the Android random-ID inputs are available.
-Credential-equivalent app identity/native security material is redacted from `repr()` output. The
-bundled App-2 profile is explicitly version-bound to the audited Popur 2.0.0 APK; callers can use
-the APK-derived or explicit-profile constructors instead when they do not want that material
-packaged with the library.
+## Home Assistant
 
-## Passive discovery
+The integration lives in `custom_components/popur/` — install via HACS custom repository or copy the directory to your HA `custom_components/`. See [`custom_components/popur/README.md`](custom_components/popur/README.md) for details.
 
-`discover_s7()` listens for Tuya LAN advertisements through TinyTuya and returns only devices whose
-product IDs match the S7 identifiers recovered from Popur App 2. Discovery is read-only and does
-not require a local key. TinyTuya's current `productKey` broadcast field and the older
-`productId`/`product_id` spellings are all recognized:
+## Status
 
-```python
-from pypopur import discover_s7
+- **Tested against**: one Popur S7 (Wi-Fi 3.0.30 / MCU 4.3.0), firmware-4 protocol family
+- **LAN protocol**: verified live — handshake, DP read/write, heartbeat, reconnect
+- **Cloud APIs**: signature-exact to the app; read paths verified live, write paths untested
+- **MQTT**: verified live — connect, subscribe, decode protocol-4/56 frames, reconnect
+- **Test suite**: 769 tests, all passing
 
-devices = await discover_s7()
-for device in devices:
-    print(device.host, device.device_id, device.protocol_version)
-```
+## Limitations
 
-The discovery result feeds the account-bootstrap flow so users do not need to type an IP address
-or device ID manually.
-
-## API shape
-
-`PopurClient` has public idempotent `connect()` and `close()` methods as well as an async context
-manager. `refresh()` returns an immutable `DeviceSnapshot`, with raw DPS retained alongside
-decoded v4 objects. Direct `read_dps()` / `write_dps()` remain available for fields that have not
-been given a high-level method.
-
-`PopurAccount.device_dps()` and `device_snapshot()` read the complete mobile device record. On the
-validated S7 this contains 40 current datapoints, including packed settings that its ordinary LAN
-status reply omits. The LAN path reports 23 active datapoints on the same firmware.
-
-Packed settings use typed models and atomic read-modify-write helpers. For common DP102 controls,
-the targeted setters always read a fresh payload while holding the client's mutation lock:
-
-```python
-await client.set_status_light(True)
-await client.set_buzzer(False)
-await client.set_clean_delay(10)
-await client.set_radar_sensitivity(6)
-await client.set_radar_range(3)
-```
-
-The APK-backed action API also covers current S7 power/reboot, self-check start/stop, dustbin
-open/close and zeroing, sifter open/close/scoop/pause, scale recalibration, and spin-sensor
-recalibration. These encodings have static and synthetic-test coverage; no live write was sent
-during the read-only device audit.
-
-For DP102, the original 29-byte payload is retained in `SystemSettings.raw`. Encoding changes only
-known fields whose model value differs from that raw payload's decoded baseline, preserving
-reserved bytes, unknown weight-function bits, and unusual firmware values that the app displays
-through fallbacks. This matches the app's read-modify-write approach and avoids unrelated cleanup
-of device state.
-
-See [`docs/protocol.md`](docs/protocol.md) for the byte layouts, standalone notification DPs,
-legacy-ID collisions, and local/cloud capability boundaries.
+- Only tested against one device and one firmware version — other S7s may differ
+- App-layer write APIs (pets, device management) are signature-verified but never executed live
+- The standalone LAN transport doesn't fetch the thing model — no schema validation on writes
+- MQTT is event-driven (deltas only) — it can't replace polling for state seeding or reconciliation
+- Settings DPs and pet data require the cloud — they don't exist on the LAN channel
 
 ## Development
 
-The LAN transport depends on TinyTuya. The test suite injects a fake local device and uses
-`unittest`, so the protocol and lifecycle layers can be verified without network access or a live
-S7:
-
-```fish
-env PYTHONPATH=src python -m unittest discover -s tests -v
-ruff check src tests
+```bash
+python -m pytest tests/          # 769 tests
+ruff check src tests             # lint
 ```
 
-A live read-only run against a real firmware-4 S7 has validated passive discovery, account/device
-matching, local-key retrieval, the Tuya 3.5 handshake, and authenticated local status polling.
-Command behavior and the LAN availability of every DP still need live-device validation. The
-tests validate the static APK model, encoder behavior, transport lifecycle, error classification,
-concurrency, and synthetic TinyTuya responses.
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Disclaimer
+
+This is an unofficial, reverse-engineered client. It is not affiliated with or endorsed by Popur. Use at your own risk — the author is not responsible for bricked devices, angry cats, or unexpected litter box behavior.

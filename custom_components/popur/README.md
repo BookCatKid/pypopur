@@ -1,59 +1,100 @@
-# Popur Home Assistant integration
+# Popur — Home Assistant Integration
 
-Local custom component for the Popur S7, built on the `pypopur`
-library (a byte-faithful port of the Popur Android App 2.0.0 SDK).
+**Experimental** — controls the Popur S7 smart litter box via LAN (preferred) and cloud (fallback/settings/pets). Built on [`pypopur`](https://github.com/BookCatKid/pypopur).
 
-## Install
+## Features
 
-`pypopur` is not on PyPI, so install it into Home Assistant's Python
-environment first:
+- **Local-first** — LAN control over TCP:6668 (Tuya protocol 3.5); routine polling never touches Tuya's servers
+- **Real-time events** — MQTT push for instant state updates (cat left, bin full, cleaning started)
+- **Pet tracking** — per-pet weight, visit duration, and last-visit sensors
+- **Full entity coverage** — 18 sensors, 5 binary sensors, 19 switches, 14 buttons, 3 selects, 5 numbers per device
+- **Cloud fallback** — automatic fallback to cloud APIs when LAN is unreachable; settings DPs and pet data always via cloud
+- **Auto-discovery** — finds the S7 on the LAN via ARP MAC match + port scan; optional explicit host override
+
+## Install via HACS
+
+1. Add `https://github.com/BookCatKid/pypopur` as a **custom repository** in HACS (type: Integration)
+2. Install "Popur"
+3. Restart Home Assistant
+4. **Settings → Devices & Services → Add Integration → Popur**
+
+## Install manually
 
 ```bash
-# HA OS / container / venv — wherever `homeassistant` lives:
-pip install -e /path/to/pypopur
+pip install pypopur
+cp -r custom_components/popur /config/custom_components/
 ```
 
-Then link the component into your HA config:
+Restart Home Assistant, then add the integration.
 
-```bash
-ln -s /path/to/pypopur/custom_components/popur \
-      /path/to/homeassistant_config/custom_components/popur
+## Configuration
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| **Email** | Yes | Popur app account email |
+| **Password** | Yes | Popur app account password |
+| **Install ID** | No | App-install identity — leave blank to auto-generate (recommended) |
+| **LAN Host** | No | Explicit device IP — leave blank to auto-discover |
+| **Poll Interval** | No | LAN poll interval in seconds (default: 60, min: 15) |
+
+## Entities
+
+### Sensors (18 per device)
+
+Machine status, running status, waste drawer level, cat presence, recent activity, cat weight, countdown, daily/total/after-full counts, manual/scheduled/auto counts, use/clean/toilet durations, fault-free time, self-check progress.
+
+### Binary sensors (5)
+
+Bin full, cat present, cleaning, fault, powered.
+
+### Switches (19)
+
+Power, status light, buzzer, anti-interference, auto clean, sentinel, caring, track pet data, auto power cycle, lower speed, reshuffle, auto self-check, notifications, 5 drawer toggles, child lock.
+
+### Buttons (14)
+
+Clean, pause, resume, self-check, sifter open/close, scoop start/pause, drawer open/close, zero bin, recalibrate spin/scale, reboot.
+
+### Selects (3)
+
+Calibration level, device color, reshuffle oscillation.
+
+### Numbers (5)
+
+Clean delay (1–60), radar sensitivity (1–10), radar range (1–5), smooth spread (2–7), cycle count (1–10).
+
+### Per-pet sensors (3 per pet)
+
+Last measured weight, last visit duration, last visit timestamp.
+
+### Diagnostics
+
+Connection sensor — shows `lan` (local control active) or `cloud` (fallback).
+
+## How it works
+
+```
+LAN (every poll interval)     ← device state, writes, reads
+MQTT (real-time)              ← DP deltas, alerts — instant updates
+Cloud (every ~10 min)         ← settings DPs, pets, records
+Cloud (on LAN failure)        ← fallback for all operations
 ```
 
-Restart Home Assistant, then **Settings → Devices & Services → Add
-Integration → Popur** and sign in with your Popur app credentials.
+- **LAN** is the fast path — reads/writes go over the local network when available
+- **MQTT** provides real-time push — entities update instantly on state changes, not on poll interval
+- **Cloud** fills the gaps — settings DPs the LAN omits, pet profiles/records, firmware info
+- **Fallback** — if LAN drops, the transport automatically falls back to cloud and retries LAN periodically
 
-## What you get
+## Pet records
 
-**Device** (per litter box, cloud-polled + real-time MQTT push)
+When a cat leaves the litter box (`cat_left` event via MQTT), the integration fetches the latest record ~45 seconds later — near-real-time weight and duration without hammering the cloud API.
 
-- Sensors: machine/running status, waste-drawer level, cat presence,
-  recent activity, cat weight, clean countdown, daily/total/after-full
-  cycle counts, per-mode cycle counts, use/clean/toilet durations,
-  fault-free time, self-check progress (fault labels in attributes)
-- Binary sensors: bin full, cat present, cleaning, fault, powered
-- Switches: power, status light, buzzer, anti-interference, auto clean,
-  sentinel/caring mode, track pet data, auto power cycle, lower drum
-  speed, litter reshuffle, auto self-check, notifications, all five
-  drawer toggles (bin-full detection, allow overfill, keep upright,
-  block on full, dump override), child lock
-- Buttons: clean now / pause / resume, self-check, sifter open/close,
-  scoop start/pause, drawer open/close, reset bin level, recalibrate
-  spin sensor, recalibrate scale, reboot
-- Selects: drawer calibration level, device color, reshuffle oscillation
-- Numbers: clean delay (1–60 min), radar sensitivity (1–10), radar
-  range (1–5), smooth spread count (2–7), drawer cycle count (1–10)
+## Limitations
 
-**Per pet** (linked to the litter box device)
+- Only tested against one Popur S7 (firmware 4.x) — other devices may differ
+- All write operations send real device commands — use with care
+- The S7 allows a single LAN session at a time — if the app or another client is connected, the integration falls back to cloud until the session frees up
 
-- Last measured weight, last visit duration, last visit timestamp —
-  decoded from the `toilet_usage_data` records the S7 reports
-  (per-visit weight + seconds, same as the app's pet stats).
+## License
 
-## Notes
-
-- Writes go through the app's own HTTP DP-publish path; the cloud
-  shadow is also the read source, so state matches what the app shows.
-- Real-time updates ride the app's MQTT channel when the broker is
-  reachable; polling (default 60 s, min 15 s) always runs.
-- All writes are real device commands — same endpoints the app calls.
+MIT — same as [pypopur](https://github.com/BookCatKid/pypopur/blob/main/LICENSE).

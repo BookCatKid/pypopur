@@ -5,14 +5,38 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pypopur"
 version = "0.1.0"
-description = "Async local-first client and firmware-4 codecs for Popur S7 devices"
+description = "Async Python client for the Popur S7 smart litter box — LAN control, cloud APIs, MQTT events, and pet tracking"
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{name = "pypopur contributors"}]
-dependencies = ["cryptography>=43", "tinytuya>=1.15"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "BookCatKid"}]
+keywords = ["popur", "s7", "litter-box", "tuya", "thingclips", "home-assistant", "iot", "smart-home"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Home Automation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "cryptography>=43",
+    "tinytuya>=1.15",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.urls]
+Homepage = "https://github.com/BookCatKid/pypopur"
+Repository = "https://github.com/BookCatKid/pypopur"
+Issues = "https://github.com/BookCatKid/pypopur/issues"
+Documentation = "https://github.com/BookCatKid/pypopur#readme"
+Changelog = "https://github.com/BookCatKid/pypopur/releases"
 
 [tool.setuptools.packages.find]
 where = ["src"]

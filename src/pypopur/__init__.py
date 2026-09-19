@@ -1,5 +1,7 @@
 """Async local-first Popur S7 library for firmware 4.x/app-v2."""
 
+__version__ = "0.1.0"
+
 from .bootstrap import LocalConfigBootstrap, resolve_local_config
 from .client import PopurClient
 from .cloud import (
@@ -251,6 +253,7 @@ __all__ = [
     "TransportError",
     "UnsupportedCloudAuthentication",
     "WeightFunctionSettings",
+    "__version__",
     "aliases_for_value",
     "bootstrap_discovered_s7",
     "bootstrap_discovered_s7_from_apk",
