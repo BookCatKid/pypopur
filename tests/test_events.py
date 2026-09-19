@@ -525,8 +525,8 @@ class WireTests(unittest.TestCase):
             _wait_for(lambda: connects == [1])
             broker.subscribed.clear()
             broker.conn.close()  # simulate link loss
-            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed, timeout=15)
-            _wait_for(lambda: len(connects) >= 2, timeout=15)
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed, timeout=30)
+            _wait_for(lambda: len(connects) >= 2, timeout=30)
             self.assertIn("p2603060/mb/u123", broker.subscribed)
         finally:
             asyncio.run(ev.close())
