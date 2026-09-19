@@ -14,15 +14,19 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.typing import ConfigType
 
 from pypopur.client import PopurClient
+from pypopur.discovery import find_lan_hosts
 from pypopur.events import DeviceEvent
+from pypopur.local import LocalTuyaTransport
 from pypopur.mobile import (
+    AccountDevice,
     MobileAppProfile,
     MobileAuthenticationError,
     PopurAccount,
     ThingMobileApi,
 )
+from pypopur.transport import FallbackTransport, PopurTransport
 
-from .const import CONF_INSTALL_ID, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_HOST, CONF_INSTALL_ID, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .coordinator import PopurCoordinator
 from .transport import CloudHttpTransport
 
@@ -36,6 +40,7 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
 
 @dataclass
 class PopurEntryData:
@@ -54,6 +59,56 @@ PopurConfigEntry = ConfigEntry[PopurEntryData]
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
+
+
+async def _local_transport(
+    device: AccountDevice, host_override: str | None
+) -> LocalTuyaTransport | None:
+    """Build the LAN transport for one device — explicit host first, then
+    ARP/neigh by the cloud-recorded MAC, then a port-6668 subnet probe.
+
+    Candidates are connect-verified (the handshake checks local_key +
+    devId), but a transport is returned even when every probe fails: the
+    S7 accepts a single LAN session at a time, so a momentarily-busy
+    device must stay retryable via FallbackTransport rather than pin the
+    entry to the cloud until the next reload."""
+
+    if not device.local_key:
+        return None
+    candidates: list[str] = []
+    if host_override:
+        candidates.append(host_override)
+    else:
+        try:
+            candidates = await find_lan_hosts(device.mac)
+        except Exception:
+            _LOGGER.debug("LAN host scan failed", exc_info=True)
+    first: LocalTuyaTransport | None = None
+    for host in candidates:
+        transport = LocalTuyaTransport(
+            host, device.device_id, device.local_key, timeout=5.0
+        )
+        if first is None:
+            first = transport
+        try:
+            await transport.connect()
+        except Exception as err:  # noqa: BLE001 — try the next candidate
+            _LOGGER.debug("local connect to %s failed: %s", host, err)
+            continue
+        _LOGGER.info(
+            "Popur %s local channel up at %s (pv %s)",
+            device.device_id,
+            host,
+            transport.protocol_version,
+        )
+        return transport
+    if first is not None:
+        _LOGGER.info(
+            "Popur %s LAN unreachable at setup — will keep retrying %s",
+            device.device_id,
+            first.config.host,
+        )
+    return first
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> bool:
@@ -77,16 +132,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
     if not homes:
         raise ConfigEntryNotReady("account has no homes")
 
-    clients: dict[str, PopurClient] = {}
     home_id: int | str = homes[0]["gid"]
     try:
         devices = await account.home_devices(home_id)
     except Exception as err:
         raise ConfigEntryNotReady(f"could not list devices: {err}") from err
-    for device in devices:
-        clients[device.device_id] = PopurClient(
-            CloudHttpTransport(account, device.device_id)
+
+    # The optional host override only makes sense for a single-device home.
+    host_override = entry.data.get(CONF_HOST) or None
+    if host_override and len(devices) != 1:
+        _LOGGER.warning(
+            "ignoring configured host %s with %d devices — use discovery",
+            host_override,
+            len(devices),
         )
+        host_override = None
+
+    clients: dict[str, PopurClient] = {}
+    for device in devices:
+        cloud: PopurTransport = CloudHttpTransport(account, device.device_id)
+        local = await _local_transport(device, host_override)
+        transport: PopurTransport = (
+            FallbackTransport(local, cloud) if local is not None else cloud
+        )
+        clients[device.device_id] = PopurClient(transport)
 
     scan_seconds = entry.data.get(
         CONF_SCAN_INTERVAL, int(DEFAULT_SCAN_INTERVAL.total_seconds())
@@ -97,6 +166,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
         home_id,
         clients,
         timedelta(seconds=scan_seconds),
+        devices={d.device_id: d for d in devices},
     )
     await coordinator.async_config_entry_first_refresh()
 
@@ -109,8 +179,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
     )
     entry.runtime_data = entry_data
 
-    # Real-time push: decode MQTT frames into coordinator merges. The
-    # wire client is thread-based; hop onto the loop for state updates.
+    # Real-time push: decode MQTT frames into coordinator merges, and
+    # resync state on every (re)connect. The wire client is thread-based;
+    # hop onto the loop for state updates.
     try:
         local_keys = {
             dev.device_id: dev.local_key
@@ -125,9 +196,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
                 )
 
         entry_data.events = account.connect_events(
-            devices=local_keys, on_event=_on_event
+            devices=local_keys,
+            on_event=_on_event,
+            on_connect=coordinator.request_refresh,
         )
         await entry_data.events.connect()
+        coordinator.events = entry_data.events
         _LOGGER.debug("Popur MQTT events connected")
     except Exception as err:  # noqa: BLE001 — realtime is best-effort; polling still works
         _LOGGER.warning("Popur realtime events unavailable, polling only: %s", err)

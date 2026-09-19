@@ -9,7 +9,13 @@ from .cloud import (
     build_business,
     build_device_api,
 )
-from .discovery import DiscoveredS7, discover_s7, parse_scan_results
+from .discovery import (
+    DiscoveredS7,
+    discover_s7,
+    find_lan_hosts,
+    parse_scan_results,
+    scan_lan_port,
+)
 from .dps import (
     FAULT_ITEMS,
     NOTIFICATION_DP_IDS,
@@ -148,7 +154,7 @@ from .reference import (
     statuses_for_value,
     wire_status,
 )
-from .transport import PopurTransport
+from .transport import FallbackTransport, PopurTransport
 from .writes import TimerInstruction, build_instruct, pet_json, pet_query_json
 
 __all__ = [
@@ -193,6 +199,7 @@ __all__ = [
     "DustbinSettings",
     "DustbinSwitch",
     "DustbinToggles",
+    "FallbackTransport",
     "FaultItem",
     "FirmwareModule",
     "HandshakeError",
@@ -280,6 +287,7 @@ __all__ = [
     "extract_apk_signing_certificate_sha256",
     "extract_popur_app2_build_config",
     "extract_thing_security_components",
+    "find_lan_hosts",
     "make_central_ingest_sink",
     "mobile_response_signature",
     "normalize_certificate_sha256",
@@ -289,6 +297,7 @@ __all__ = [
     "recurrence_mask_to_text",
     "recurrence_text_to_mask",
     "resolve_local_config",
+    "scan_lan_port",
     "sign_mobile_params",
     "statuses_for_value",
     "wire_status",

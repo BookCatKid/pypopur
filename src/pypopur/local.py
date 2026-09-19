@@ -265,7 +265,13 @@ class LocalTuyaTransport(PopurTransport):
 
     @property
     def connected(self) -> bool:
-        return self._device is not None
+        """Live session — the gw must still be in ``DevTransfer.live_gw``;
+        a link that died (or was evicted) requires re-handshake."""
+
+        return (
+            self._device is not None
+            and self._config.device_id in self._transfer.live_gw
+        )
 
     @property
     def transfer(self) -> DevTransfer:
@@ -341,25 +347,51 @@ class LocalTuyaTransport(PopurTransport):
             if dev_id not in self._transfer.connecting_gw:
                 # Connecting entry cleared without reaching live_gw —
                 # connect or handshake failed.
-                self._api.close_device(dev_id)
+                self._teardown_probe(dev_id)
                 raise HandshakeError(
                     "Device rejected the local handshake (local key or protocol version)"
                 )
             time.sleep(0.005)
-        self._api.close_device(dev_id)
+        self._teardown_probe(dev_id)
         raise TransportError(f"Local handshake timed out for protocol {version}")
+
+    def _teardown_probe(self, dev_id: str) -> None:
+        """Fully clear a failed probe so the next version starts clean —
+        the S7 allows a single LAN session, so a lingering socket/link
+        would reject the follow-up handshake. ``deleteDev`` only acts on
+        live gws, so the connecting entry is popped explicitly."""
+
+        self._api.close_device(dev_id)
+        self._hardware.remove_hgw_bean(dev_id)
+        self._transfer.delete_dev(dev_id)
+        self._transfer.connecting_gw.pop(dev_id, None)
+        self._cache.dev_bean_map.pop(dev_id, None)
 
     async def connect(self) -> None:
         async with self._lock:
             if self._device is not None:
-                return
-            versions = (
-                (self._config.protocol_version,)
-                if self._config.protocol_version is not None
-                else self.AUTO_PROTOCOL_VERSIONS
-            )
+                if self._config.device_id in self._transfer.live_gw:
+                    return
+                # Gw evicted — the socket died or a stale callback removed
+                # it; clear and re-handshake instead of failing forever.
+                self._device = None
+                self._hgw = None
+            if self._config.protocol_version is not None:
+                versions = (self._config.protocol_version,)
+            elif self._selected_protocol_version is not None:
+                # Reconnect: try the previously negotiated version first.
+                versions = (self._selected_protocol_version,) + tuple(
+                    v for v in self.AUTO_PROTOCOL_VERSIONS
+                    if v != self._selected_protocol_version
+                )
+            else:
+                versions = self.AUTO_PROTOCOL_VERSIONS
             failures: list[tuple[str, Exception]] = []
-            for version in versions:
+            for attempt, version in enumerate(versions):
+                if attempt:
+                    # The device can still be tearing down the previous
+                    # session; give it a beat or the next SYN is refused.
+                    await asyncio.sleep(0.4)
                 try:
                     await asyncio.to_thread(self._connect_once, version)
                 except (
@@ -389,9 +421,7 @@ class LocalTuyaTransport(PopurTransport):
             self._device = None
             self._hgw = None
             self._selected_protocol_version = None
-            self._cache.dev_bean_map.pop(dev_id, None)
-            self._hardware.remove_hgw_bean(dev_id)
-            await asyncio.to_thread(self._transfer.delete_dev, dev_id)
+            await asyncio.to_thread(self._teardown_probe, dev_id)
 
     async def read_dps(self, ids: Collection[int] | None = None) -> Mapping[int, Any]:
         await self.connect()

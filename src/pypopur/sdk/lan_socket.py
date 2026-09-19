@@ -546,7 +546,9 @@ class SocketThingNetworkApi(ThingNetworkApi):
                 self._negotiate_35(link, real_key)
         except Exception as exc:
             link.negotiating = False
-            if self._iface is not None:
+            # A stale/replaced link's failure must not fault the session
+            # that superseded it (auto-probe races the next link's gw).
+            if self._iface is not None and self._links.get(link.dev_id) is link:
                 self._iface.dispatch_handshake_error(link.dev_id, -1, str(exc))
             return
         link.negotiating = False
@@ -583,7 +585,7 @@ class SocketThingNetworkApi(ThingNetworkApi):
             raise OSError("SESS_KEY_NEG_FINISH send failed")
         xored = bytes(a ^ b for a, b in zip(local_nonce, remote_nonce))
         link.session_key = _ecb_nopad_encrypt(real_key, xored)[:16]
-        if self._iface is not None:
+        if self._iface is not None and self._links.get(link.dev_id) is link:
             self._iface.dispatch_handshake_success(link.dev_id)
 
     def _negotiate_35(self, link: _Link, real_key: bytes) -> None:
@@ -604,7 +606,7 @@ class SocketThingNetworkApi(ThingNetworkApi):
         xored = bytes(a ^ b for a, b in zip(local_nonce, remote_nonce))
         ct = AESGCM(real_key).encrypt(local_nonce[:12], xored, None)
         link.session_key = ct[:16]
-        if self._iface is not None:
+        if self._iface is not None and self._links.get(link.dev_id) is link:
             self._iface.dispatch_handshake_success(link.dev_id)
 
     # --- inbound ---------------------------------------------------------
@@ -635,7 +637,12 @@ class SocketThingNetworkApi(ThingNetworkApi):
         finally:
             was_online = link.online
             link.online = False
-            if was_online and not link.closed and self._iface is not None:
+            if (
+                was_online
+                and not link.closed
+                and self._iface is not None
+                and self._links.get(link.dev_id) is link
+            ):
                 self._iface.dispatch_link_close(link.dev_id, -1)
             self._close_link(link, dispatch=False)
 

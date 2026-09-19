@@ -11,6 +11,7 @@ does inside ``ThingNetworkInterface``.
 from __future__ import annotations
 
 import asyncio
+import re
 import socket
 import threading
 from collections.abc import Callable, Mapping
@@ -246,3 +247,128 @@ async def discover_s7(
         if own_api:
             api.shutdown()
     return hgw_beans_to_discovered(collector.beans)
+
+
+# ---------------------------------------------------------------------------
+# Active LAN-host location — the S7 only broadcasts during pairing, so a
+# running device is found by its cloud-recorded MAC (ARP/neigh table) or by
+# probing the LAN port directly.
+# ---------------------------------------------------------------------------
+
+S7_LAN_PORT = 6668
+
+
+def _normalize_mac(mac: str) -> str:
+    """Normalize to 12 lowercase hex chars — handles both padded
+    (``00:33:7a:07:d7:e6``) and unpadded (``0:33:7a:7:d7:e6``, as
+    ``arp -a`` prints) octet forms."""
+
+    if ":" in mac or "-" in mac:
+        parts = re.split(r"[:-]", mac)
+        return "".join(p.zfill(2).lower() for p in parts if p)
+    return "".join(c for c in mac.lower() if c in "0123456789abcdef")
+
+
+def _arp_ips_for_mac(mac: str) -> list[str]:
+    """MAC → IPv4 via ``/proc/net/arp`` (Linux/HA container) then ``arp -a``."""
+
+    wanted = _normalize_mac(mac)
+    if len(wanted) != 12:
+        return []
+    ips: list[str] = []
+    try:
+        with open("/proc/net/arp") as fh:
+            next(fh, None)  # header
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 4 and _normalize_mac(parts[3]) == wanted:
+                    ips.append(parts[0])
+    except OSError:
+        pass
+    if not ips:
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                ["arp", "-a"], capture_output=True, text=True, timeout=5, check=False
+            ).stdout
+            for line in out.splitlines():
+                # "? (192.168.1.128) at 0:33:7a:7:d7:e6 on en0 ..."
+                m_ip = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
+                m_mac = re.search(r"at\s+([0-9a-fA-F:]{11,17})", line)
+                if m_ip and m_mac and _normalize_mac(m_mac.group(1)) == wanted:
+                    ips.append(m_ip.group(1))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ips
+
+
+async def _port_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return True
+    except (OSError, TimeoutError):
+        return False
+
+
+async def scan_lan_port(
+    subnet: str | None = None,
+    *,
+    port: int = S7_LAN_PORT,
+    timeout: float = 0.8,
+) -> list[str]:
+    """TCP-connect scan of the local /24 for hosts listening on ``port``.
+
+    ``subnet`` is the first three octets (``"192.168.1"``); defaults to
+    the outbound interface's /24. Returns sorted hosts with the port open.
+    """
+
+    if subnet is None:
+        local = await asyncio.to_thread(_local_ip)
+        if local is None:
+            return []
+        subnet = local.rpartition(".")[0]
+    sem = asyncio.Semaphore(128)
+
+    async def probe(i: int) -> str | None:
+        host = f"{subnet}.{i}"
+        async with sem:
+            return host if await _port_open(host, port, timeout) else None
+
+    results = await asyncio.gather(*(probe(i) for i in range(1, 255)))
+    return sorted(
+        (h for h in results if h), key=lambda h: _ipv4_to_int(h)
+    )
+
+
+async def find_lan_hosts(
+    mac: str | None = None,
+    *,
+    port: int = S7_LAN_PORT,
+    subnet: str | None = None,
+    timeout: float = 0.8,
+) -> list[str]:
+    """Locate a device's LAN IP candidates for the local transport.
+
+    With ``mac`` (the cloud record's ``mac`` field), ARP/neigh matches are
+    tried first — each is confirmed by an open ``port``. Without a match,
+    falls back to a full /24 probe of ``port``. Returns candidates in
+    priority order; the caller verifies identity via the LAN handshake.
+    """
+
+    candidates: list[str] = []
+    if mac:
+        for ip in await asyncio.to_thread(_arp_ips_for_mac, mac):
+            if await _port_open(ip, port, timeout):
+                candidates.append(ip)
+    for host in await scan_lan_port(subnet, port=port, timeout=timeout):
+        if host not in candidates:
+            candidates.append(host)
+    return candidates

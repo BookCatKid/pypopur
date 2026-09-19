@@ -429,6 +429,7 @@ class AccountDevice:
     name: str | None
     local_key: str | None = field(default=None, repr=False)
     ip: str | None = None
+    mac: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __repr__(self) -> str:
@@ -2464,6 +2465,7 @@ class PopurAccount:
         install_id: str | None = None,
         on_event: Callable[[DeviceEvent], None] | None = None,
         on_error: Callable[[str, str, str], None] | None = None,
+        on_connect: Callable[[], None] | None = None,
         dedup: ThingMessageCache | None = None,
         sock_factory: Callable | None = None,
         tls_context: Any = None,
@@ -2491,6 +2493,7 @@ class PopurAccount:
             devices=devices,
             on_event=on_event,
             on_error=on_error,
+            on_connect=on_connect,
             dedup=dedup,
             sock_factory=sock_factory,
             tls_context=tls_context,
@@ -2552,6 +2555,7 @@ def _parse_device(mapping: Mapping[str, Any]) -> AccountDevice:
         name=_optional_text(mapping.get("name")),
         local_key=_optional_text(mapping.get("localKey")),
         ip=_optional_text(mapping.get("ip")),
+        mac=_optional_text(mapping.get("mac")),
         raw=dict(mapping),
     )
 

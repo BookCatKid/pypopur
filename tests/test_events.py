@@ -508,5 +508,30 @@ class WireTests(unittest.TestCase):
             broker.stop()
 
 
+    def test_reconnect_resubscribes_and_fires_on_connect(self) -> None:
+        # Link loss → _link_lost → _try_reconnect → on_connect_success →
+        # the desired topics are re-SUBSCRIBEd (clean session drops them)
+        # and the on_connect hook fires for resync.
+        broker = FakeBroker()
+        events: list[DeviceEvent] = []
+        connects: list[int] = []
+        ev = self._events_on_broker(broker, events)
+        ev._on_connect = lambda: connects.append(1)
+        try:
+            import asyncio
+
+            asyncio.run(ev.connect())
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
+            _wait_for(lambda: connects == [1])
+            broker.subscribed.clear()
+            broker.conn.close()  # simulate link loss
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed, timeout=15)
+            _wait_for(lambda: len(connects) >= 2, timeout=15)
+            self.assertIn("p2603060/mb/u123", broker.subscribed)
+        finally:
+            asyncio.run(ev.close())
+            broker.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -274,6 +274,7 @@ class PopurMqttEvents:
         devices: Mapping[str, str] | None = None,
         on_event: Callable[[DeviceEvent], None] | None = None,
         on_error: Callable[[str, str, str], None] | None = None,
+        on_connect: Callable[[], None] | None = None,
         dedup: ThingMessageCache | None = None,
         sock_factory: Callable | None = None,
         tls_context: Any = None,
@@ -285,6 +286,7 @@ class PopurMqttEvents:
         self._install_id = install_id
         self._on_event = on_event or (lambda event: None)
         self._on_error = on_error
+        self._on_connect = on_connect
         self._dedup = dedup or ThingMessageCache()
         self._sock_factory = sock_factory
         self._tls_context = tls_context
@@ -336,6 +338,40 @@ class PopurMqttEvents:
             tls_context=tls_context,
         )
         self._user_topic = user_topic
+        # Desired topic → qos set; re-issued after every reconnect because
+        # the session is clean (broker drops subscriptions on disconnect).
+        self._subscriptions: dict[str, int] = {}
+        events = self
+
+        class _StatusCallback:
+            def on_connect_success(self) -> None:
+                events._resubscribe()
+                if events._on_connect is not None:
+                    try:
+                        events._on_connect()
+                    except Exception:
+                        log.exception("mqtt on_connect callback failed")
+
+            def on_connect_error(self, code: str, error: str) -> None:
+                if events._on_error is not None:
+                    try:
+                        events._on_error("connect", code, error)
+                    except Exception:
+                        log.exception("mqtt on_error callback failed")
+
+        self.client.register_mqtt_callback(_StatusCallback())
+
+    def _resubscribe(self) -> None:
+        """Re-SUBSCRIBE every desired topic after a (re)connect — the
+        manager's ``subscribe_state`` still shows them live, so reset to
+        pending first or ``client.subscribe`` would skip the wire call."""
+
+        topics = list(self._subscriptions)
+        for topic in topics:
+            if self.manager.subscribe_state.get(topic) is True:
+                self.manager.subscribe_state[topic] = False
+        if topics:
+            self.client.subscribe(topics, [self._subscriptions[t] for t in topics], None)
 
     @property
     def connected(self) -> bool:
@@ -351,17 +387,22 @@ class PopurMqttEvents:
         """``IMqttServer.subscribe("smart/mb/in/"+devId)`` — live decode
         requires :meth:`register_device` first."""
 
+        self._subscriptions[SMART_MB_IN + dev_id] = qos
         self.client.subscribe([SMART_MB_IN + dev_id], [qos], None)
 
     async def connect(self, dev_ids: list[str] | None = None) -> None:
         """Open the TLS session and subscribe the device + user topics."""
 
         await asyncio.to_thread(self.client.connect)
-        topics = [SMART_MB_IN + dev_id for dev_id in (dev_ids or sorted(self.listener._local_keys))]
+        for dev_id in dev_ids or sorted(self.listener._local_keys):
+            self._subscriptions[SMART_MB_IN + dev_id] = 1
         if self._user_topic:
-            topics.append(self._user_topic)
-        if topics:
-            await asyncio.to_thread(self.client.subscribe, topics, [1] * len(topics), None)
+            self._subscriptions[self._user_topic] = 1
+        if self._subscriptions:
+            topics = list(self._subscriptions)
+            await asyncio.to_thread(
+                self.client.subscribe, topics, [1] * len(topics), None
+            )
 
     async def close(self) -> None:
         await asyncio.to_thread(self.client.close)

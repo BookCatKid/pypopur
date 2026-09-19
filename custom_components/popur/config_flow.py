@@ -18,7 +18,13 @@ from pypopur.mobile import (
     ThingMobileApi,
 )
 
-from .const import CONF_INSTALL_ID, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import (
+    CONF_HOST,
+    CONF_INSTALL_ID,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +32,7 @@ STEP_USER_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): cv.string,
         vol.Required(CONF_PASSWORD): cv.string,
+        vol.Optional(CONF_HOST): cv.string,
         vol.Optional(CONF_INSTALL_ID): cv.string,
         vol.Optional(
             CONF_SCAN_INTERVAL,
@@ -70,6 +77,7 @@ class PopurConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_PASSWORD: password,
                         CONF_INSTALL_ID: install_id,
                         CONF_SCAN_INTERVAL: user_input[CONF_SCAN_INTERVAL],
+                        CONF_HOST: (user_input.get(CONF_HOST) or "").strip(),
                     },
                 )
 

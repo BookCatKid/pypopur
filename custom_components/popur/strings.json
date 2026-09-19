@@ -7,6 +7,7 @@
         "data": {
           "email": "Email",
           "password": "Password",
+          "host": "Device LAN IP (optional — auto-discovered if blank)",
           "install_id": "Install ID (optional)",
           "scan_interval": "Poll interval (seconds)"
         }
@@ -40,6 +41,7 @@
       "cat_toilet_time": { "name": "Last toilet duration" },
       "fault_free_time": { "name": "Fault-free time" },
       "self_check": { "name": "Self-check progress" },
+      "connection": { "name": "Connection" },
       "pet_last_weight": { "name": "Last measured weight" },
       "pet_last_visit_duration": { "name": "Last visit duration" },
       "pet_last_visit": { "name": "Last visit" }

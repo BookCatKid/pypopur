@@ -197,6 +197,7 @@ async def async_setup_entry(
             PopurDeviceSensor(coordinator, client, device, desc)
             for desc in DEVICE_SENSORS
         )
+        entities.append(PopurConnectionSensor(coordinator, client, device))
         if coordinator.data:
             for pet_id in coordinator.data.pets:
                 entities.extend(
@@ -228,6 +229,29 @@ class PopurDeviceSensor(PopurEntity, SensorEntity):
         if self.entity_description.attrs_fn is None or self.snapshot is None:
             return None
         return self.entity_description.attrs_fn(self.snapshot)
+
+
+class PopurConnectionSensor(PopurEntity, SensorEntity):
+    """Diagnostic sensor: which channel currently serves the device."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "connection"
+
+    def __init__(self, coordinator, client, device) -> None:
+        super().__init__(coordinator, client, device)
+        self._attr_unique_id = f"{device.device_id}_connection"
+
+    @property
+    def native_value(self) -> str | None:
+        if self.coordinator.data is None:
+            return None
+        return self.coordinator.data.transports.get(self.device.device_id)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.coordinator.data is None:
+            return None
+        return {"mqtt_connected": self.coordinator.data.mqtt_connected}
 
 
 PET_SENSORS: tuple[SensorEntityDescription, ...] = (
