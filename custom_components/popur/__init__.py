@@ -35,6 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
+    Platform.EVENT,
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
@@ -214,6 +215,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
 async def async_unload_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> bool:
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         data = entry.runtime_data
+        data.coordinator.cancel_record_fetch()
         if data.events is not None:
             try:
                 await data.events.close()

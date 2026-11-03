@@ -9,16 +9,25 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from pypopur import decode_snapshot
+from pypopur.activity import ActivityEvent, extract_activity_events
 from pypopur.discovery import find_lan_hosts
 from pypopur.local import LocalTuyaTransport
 from pypopur.models import DeviceSnapshot
 from pypopur.reads import Pet, PetRecord
 from pypopur.transport import FallbackTransport
 
-from .const import CLOUD_REFRESH_INTERVAL, DOMAIN, PET_RECORDS_PAGE_SIZE
+from .const import (
+    CLOUD_REFRESH_INTERVAL,
+    DOMAIN,
+    PET_RECORDS_PAGE_SIZE,
+    signal_device_event,
+    signal_pet_visit,
+)
 
 if TYPE_CHECKING:
     from pypopur.client import PopurClient
@@ -82,6 +91,9 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         self._next_cloud_refresh = 0.0
         self._record_fetch_task: asyncio.TimerHandle | None = None
         self._record_fetch_attempt = 0
+        # Set after the first successful records fetch: visits seen before
+        # that are history, not new events.
+        self._pet_visits_loaded = False
 
     def transport_state(self, dev_id: str) -> str:
         """Which channel last served this device: ``lan`` or ``cloud``."""
@@ -200,6 +212,7 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         page = await self.account.pet_records(
             self.home_id, page_size=PET_RECORDS_PAGE_SIZE
         )
+        previous = data.pet_visits
         visits: dict[int, PetVisit] = {}
         for record in page.records:
             pet_id = record.pet_id
@@ -212,6 +225,51 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
                 duration_seconds=usage.duration_seconds if usage else None,
             )
         data.pet_visits = visits
+        if self._pet_visits_loaded:
+            self._dispatch_new_visits(previous, visits)
+        self._pet_visits_loaded = True
+
+    def _dispatch_new_visits(
+        self, previous: dict[int, PetVisit], visits: dict[int, PetVisit]
+    ) -> None:
+        """Signal each pet whose latest record is newer than the last known one.
+
+        A pet with no previous visit only counts when its record is newer
+        than every record known before, so a newly listed pet does not
+        replay its history."""
+
+        baseline = max(
+            (v.record.record_time or 0 for v in previous.values()), default=0
+        )
+        for pet_id, visit in visits.items():
+            record_time = visit.record.record_time
+            if record_time is None:
+                continue
+            prev = previous.get(pet_id)
+            last_known = (
+                prev.record.record_time or 0 if prev is not None else baseline
+            )
+            if record_time <= last_known:
+                continue
+            attrs: dict[str, Any] = {
+                "pet_id": pet_id,
+                "weight_g": visit.weight_grams,
+                "duration_s": visit.duration_seconds,
+                "record_time": dt_util.utc_from_timestamp(
+                    record_time / 1000
+                ).isoformat(),
+            }
+            if visit.record.dev_id:
+                attrs["device_id"] = visit.record.dev_id
+            _LOGGER.debug("New visit recorded for pet %s: %s", pet_id, attrs)
+            async_dispatcher_send(self.hass, signal_pet_visit(pet_id), attrs)
+
+    def cancel_record_fetch(self) -> None:
+        """Cancel a pending delayed record fetch (entry unload)."""
+
+        if self._record_fetch_task is not None:
+            self._record_fetch_task.cancel()
+            self._record_fetch_task = None
 
     def _schedule_record_fetch(self) -> None:
         """Debounce + schedule a delayed record fetch after ``cat_left``."""
@@ -258,16 +316,38 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         )
 
     def push_dps(self, dev_id: str, dps: dict[int, Any]) -> None:
-        """Merge a real-time MQTT push into the cached snapshot."""
+        """Merge a real-time MQTT push into the cached snapshot.
+
+        Only live pushes reach this method, so this is the single place
+        activity/fault events are raised: polling never replays them."""
         if self.data is None or dev_id not in self.clients:
             return
         old = self.data.snapshots.get(dev_id)
-        merged = dict(old.raw_dps) if old else {}
+        previous_raw = dict(old.raw_dps) if old else {}
+        events = extract_activity_events(dps, previous_raw)
+        received_at = dt_util.utcnow()
+
+        merged = dict(previous_raw)
         merged.update(dps)
         self.data.snapshots[dev_id] = decode_snapshot(merged)
         self.async_set_updated_data(self.data)
 
+        for event in events:
+            self._dispatch_device_event(dev_id, event, received_at)
+
         # A cat just left — the record lands in the cloud shortly after.
         # Fetch it on a delay rather than waiting for the slow timer.
-        if 22 in dps and dps[22] == "cat_left":
+        if any(event.event_type == "cat_left" for event in events):
             self._schedule_record_fetch()
+
+    def _dispatch_device_event(
+        self, dev_id: str, event: ActivityEvent, received_at
+    ) -> None:
+        attrs: dict[str, Any] = {
+            **event.attributes,
+            "source": "mqtt",
+            "raw_value": event.raw_value,
+            "received_at": received_at.isoformat(),
+        }
+        _LOGGER.debug("Popur %s event %s: %s", dev_id, event.event_type, attrs)
+        async_dispatcher_send(self.hass, signal_device_event(dev_id), event, attrs)

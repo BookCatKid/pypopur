@@ -53,6 +53,49 @@
       "fault": { "name": "Fault" },
       "powered": { "name": "Powered" }
     },
+    "event": {
+      "activity": {
+        "name": "Activity",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "cat_exist": "Pet detected",
+              "cat_left": "Pet left without business",
+              "cat_done_business": "Pet finished the business",
+              "manual_clean_completed": "Manual cleaning completed",
+              "scheduled_clean_completed": "Scheduled cleaning completed",
+              "automatic_clean_completed": "Automatic cleaning completed",
+              "bin_full": "Bin full",
+              "self_check_completed": "Self-check completed",
+              "cleaning_started": "Cleaning started",
+              "cleaning_paused": "Cleaning paused",
+              "cleaning_resumed": "Cleaning resumed"
+            }
+          }
+        }
+      },
+      "fault_event": {
+        "name": "Fault event",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "fault_detected": "Fault detected",
+              "fault_cleared": "Fault cleared"
+            }
+          }
+        }
+      },
+      "pet_visit": {
+        "name": "Visit",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "visit_recorded": "Visit recorded"
+            }
+          }
+        }
+      }
+    },
     "switch": {
       "power": { "name": "Power" },
       "status_light": { "name": "Status light" },

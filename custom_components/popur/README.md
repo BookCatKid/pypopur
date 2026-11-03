@@ -7,7 +7,8 @@
 - **Local-first** — LAN control over TCP:6668 (Tuya protocol 3.5); routine polling never touches Tuya's servers
 - **Real-time events** — MQTT push for instant state updates (cat left, bin full, cleaning started)
 - **Pet tracking** — per-pet weight, visit duration, and last-visit sensors
-- **Full entity coverage** — 18 sensors, 5 binary sensors, 19 switches, 14 buttons, 3 selects, 5 numbers per device
+- **Full entity coverage** — 18 sensors, 5 binary sensors, 2 event entities, 19 switches, 14 buttons, 3 selects, 5 numbers per device
+- **Event entities** — litter box activity, faults and pet visits, ready for automation triggers
 - **Cloud fallback** — automatic fallback to cloud APIs when LAN is unreachable; settings DPs and pet data always via cloud
 - **Auto-discovery** — finds the S7 on the LAN via ARP MAC match + port scan; optional explicit host override
 
@@ -67,6 +68,60 @@ Clean delay (1–60), radar sensitivity (1–10), radar range (1–5), smooth sp
 
 Last measured weight, last visit duration, last visit timestamp.
 
+### Event entities
+
+Event entities keep the last event type and its attributes; Home Assistant records the time it was received. They fire **only on live events**: activity and faults come from MQTT pushes, visits from newly fetched cloud records. Polling, the first load and MQTT reconnects never fire them, so an event missed while MQTT was down is not replayed.
+
+| Entity | Unique ID | Event types | Attributes |
+|--------|-----------|-------------|------------|
+| Activity (per device) | `<dev_id>_activity` | `cat_exist`, `cat_left`, `cat_done_business`, `manual_clean_completed`, `scheduled_clean_completed`, `automatic_clean_completed`, `bin_full`, `self_check_completed`, `cleaning_started`, `cleaning_paused`, `cleaning_resumed` | `source`, `raw_value`, `received_at` |
+| Fault event (per device, diagnostic) | `<dev_id>_fault_event` | `fault_detected`, `fault_cleared` (one event per changed fault bit) | `fault`, `url`, `mask`, `source`, `raw_value`, `received_at` |
+| Visit (per pet) | `pet_<pet_id>_visit` | `visit_recorded` | `pet_id`, `weight_g`, `duration_s`, `record_time`, `device_id` |
+
+The activity entity fires on every activity report, even when the same type repeats (each report is a real event). The `Recent activity` sensor is still available and shows the last reported value.
+
+Example automation with the `event.received` trigger:
+
+```yaml
+- alias: "Litter box: notify when the drawer is full"
+  triggers:
+    - trigger: event.received
+      target:
+        entity_id: event.popur_s7_activity
+      options:
+        event_type:
+          - bin_full
+  actions:
+    - action: notify.send_message
+      target:
+        entity_id: notify.my_device
+      data:
+        message: "The litter box waste drawer is full."
+```
+
+Alternative with a `state` trigger (works on older releases). The state of an event entity is the timestamp of the last event, so filter on `event_type`, and ignore the transition out of `unavailable` (for example after a restart):
+
+```yaml
+- alias: "Litter box: log each visit"
+  triggers:
+    - trigger: state
+      entity_id: event.minou_visit
+      not_from:
+        - unavailable
+  conditions:
+    - condition: state
+      entity_id: event.minou_visit
+      attribute: event_type
+      state: visit_recorded
+  actions:
+    - action: logbook.log
+      data:
+        name: Minou
+        message: >-
+          Visit: {{ trigger.to_state.attributes.weight_g }} g,
+          {{ trigger.to_state.attributes.duration_s }} s
+```
+
 ### Diagnostics
 
 Connection sensor — shows `lan` (local control active) or `cloud` (fallback).
@@ -87,7 +142,7 @@ Cloud (on LAN failure)        ← fallback for all operations
 
 ## Pet records
 
-When a cat leaves the litter box (`cat_left` event via MQTT), the integration fetches the latest record ~45 seconds later — near-real-time weight and duration without hammering the cloud API.
+When a cat leaves the litter box (`cat_left` event via MQTT), the integration fetches the latest record ~45 seconds later — near-real-time weight and duration without hammering the cloud API. Each record newer than the last known one for a pet fires that pet's `visit_recorded` event.
 
 ## Limitations
 

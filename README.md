@@ -15,7 +15,7 @@
 - **Discovery** — passive UDP announcements plus active host location via ARP MAC match and port-6668 subnet scan
 - **DP codecs** — all firmware-4 packed payloads decoded (settings, calibration, radar config, cat weight, visit records)
 - **Pet tracking** — household pet profiles, per-visit weight/duration records decoded from the app's own format
-- **Home Assistant integration** — full entity coverage (sensors, switches, buttons, numbers, selects) in `custom_components/popur/`
+- **Home Assistant integration** — full entity coverage (sensors, switches, buttons, numbers, selects, event entities for activity, faults and pet visits) in `custom_components/popur/`
 
 ## Install
 
