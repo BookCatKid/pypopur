@@ -1,6 +1,6 @@
 """Async local-first Popur S7 library for firmware 4.x/app-v2."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.3"
 
 from .activity import (
     ACTIVITY_EVENT_TYPES,
