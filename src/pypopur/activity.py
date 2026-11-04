@@ -79,8 +79,8 @@ def _fault_events(value: Any, previous: Any) -> list[ActivityEvent]:
 
 
 def extract_activity_events(
-    dps: Mapping[int, Any],
-    previous_raw: Mapping[int, Any] | None = None,
+    dps: Mapping[int | str, Any],
+    previous_raw: Mapping[int | str, Any] | None = None,
 ) -> list[ActivityEvent]:
     """Extract activity (DP22) and fault (DP125) events from one DP report.
 

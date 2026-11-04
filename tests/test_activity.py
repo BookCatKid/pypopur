@@ -83,11 +83,17 @@ class Dp22Tests(unittest.TestCase):
                 self.assertEqual([e.event_type for e in events], [expected])
                 self.assertEqual(events[0].raw_value, raw)
 
-    def test_every_event_type_is_in_activity_event_types(self) -> None:
+    def test_every_activity_maps_to_its_event_type(self) -> None:
         for activity in RecentActivity:
-            events = extract_activity_events({22: int(activity)})
-            for event in events:
-                self.assertIn(event.event_type, ACTIVITY_EVENT_TYPES)
+            with self.subTest(activity=activity):
+                events = extract_activity_events({22: int(activity)})
+                if activity is RecentActivity.IDLE:
+                    self.assertEqual(events, [])
+                    continue
+                self.assertEqual(
+                    [e.event_type for e in events], [activity.name.lower()]
+                )
+                self.assertIn(events[0].event_type, ACTIVITY_EVENT_TYPES)
 
     def test_idle_yields_nothing(self) -> None:
         self.assertEqual(extract_activity_events({22: "idle"}), [])

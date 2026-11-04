@@ -40,13 +40,31 @@ async def async_setup_entry(
         pet_device = pet_device or device
         entities.append(PopurActivityEvent(coordinator, client, device))
         entities.append(PopurFaultEvent(coordinator, client, device))
-    # One visit entity per pet (pets are household-wide, not per device).
-    if coordinator.data and pet_device is not None:
-        entities.extend(
-            PopurPetVisitEvent(coordinator, pet_device, pet_id)
-            for pet_id in coordinator.data.pets
-        )
     async_add_entities(entities)
+
+    if pet_device is None:
+        return
+
+    # One visit entity per pet (pets are household-wide, not per device).
+    # Pets can show up after setup (added in the app, or pet data
+    # unavailable at first refresh): add their entity when they appear.
+    known_pets: set[int] = set()
+
+    @callback
+    def _add_new_pets() -> None:
+        if coordinator.data is None:
+            return
+        new_pets = [p for p in coordinator.data.pets if p not in known_pets]
+        if not new_pets:
+            return
+        known_pets.update(new_pets)
+        async_add_entities(
+            PopurPetVisitEvent(coordinator, pet_device, pet_id)
+            for pet_id in new_pets
+        )
+
+    _add_new_pets()
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_pets))
 
 
 class _PopurDeviceEvent(PopurEntity, EventEntity):

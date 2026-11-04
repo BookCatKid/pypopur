@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -89,11 +90,20 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         self._devices = devices or {}
         self._shadow_dps: dict[str, dict[int, Any]] = {}
         self._next_cloud_refresh = 0.0
-        self._record_fetch_task: asyncio.TimerHandle | None = None
+        self._record_fetch_timer: asyncio.TimerHandle | None = None
+        self._record_fetch_task: asyncio.Task[None] | None = None
         self._record_fetch_attempt = 0
-        # Set after the first successful records fetch: visits seen before
-        # that are history, not new events.
-        self._pet_visits_loaded = False
+        # Pet records are fetched by both the slow tier and the delayed
+        # post-``cat_left`` fetch; the lock serializes them so one record
+        # is never dispatched twice.
+        self._pet_lock = asyncio.Lock()
+        # Newest record time already seen, per pet. ``None`` until the
+        # first successful fetch: records seen then are history, not events.
+        self._seen_record_time: dict[int, int] | None = None
+        # Newest record time of that first fetch: pets appearing later only
+        # count records newer than it, so they do not replay their history.
+        self._records_baseline = 0
+        self._latest_visits: dict[int, PetVisit] = {}
 
     def transport_state(self, dev_id: str) -> str:
         """Which channel last served this device: ``lan`` or ``cloud``."""
@@ -202,71 +212,87 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         except Exception as err:  # noqa: BLE001 — pets are auxiliary; never fail the refresh
             _LOGGER.debug("pet data refresh failed: %s", err)
 
-    async def _refresh_pet_data(self, data: PopurRuntimeData) -> None:
-        """Fetch latest pet profiles + records into ``data``."""
+    async def _refresh_pet_data(self, data: PopurRuntimeData) -> int:
+        """Fetch latest pet profiles + records into ``data``.
 
-        pets: dict[int, Pet] = {}
-        for pet in await self.account.pets(self.home_id):
-            pets[pet.pet_id] = pet
-        data.pets = pets
-        page = await self.account.pet_records(
-            self.home_id, page_size=PET_RECORDS_PAGE_SIZE
+        Signals one ``visit_recorded`` per new toilet-usage record and
+        returns the number of new records seen (of any kind)."""
+
+        async with self._pet_lock:
+            pets: dict[int, Pet] = {}
+            for pet in await self.account.pets(self.home_id):
+                pets[pet.pet_id] = pet
+            data.pets = pets
+            page = await self.account.pet_records(
+                self.home_id, page_size=PET_RECORDS_PAGE_SIZE
+            )
+
+            # Latest record per pet; a pet whose records fell off this page
+            # keeps its previously known visit.
+            visits = dict(self._latest_visits)
+            latest_on_page: set[int] = set()
+            for record in page.records:  # newest-first
+                pet_id = record.pet_id
+                if pet_id is None or pet_id in latest_on_page:
+                    continue
+                latest_on_page.add(pet_id)
+                usage = record.toilet_usage()
+                visits[pet_id] = PetVisit(
+                    record=record,
+                    weight_grams=usage.weight_grams if usage else None,
+                    duration_seconds=usage.duration_seconds if usage else None,
+                )
+            self._latest_visits = visits
+            data.pet_visits = visits
+            return self._dispatch_new_records(page.records)
+
+    def _dispatch_new_records(self, records: Sequence[PetRecord]) -> int:
+        """Signal every toilet-usage record newer than the last one seen for
+        its pet, oldest first; advance the per-pet watermarks."""
+
+        dated = sorted(
+            (r for r in records if r.pet_id is not None and r.record_time is not None),
+            key=lambda r: r.record_time,
         )
-        previous = data.pet_visits
-        visits: dict[int, PetVisit] = {}
-        for record in page.records:
-            pet_id = record.pet_id
-            if pet_id is None or pet_id in visits:
-                continue  # records are newest-first
+        if self._seen_record_time is None:
+            # First successful fetch: history, not events.
+            self._seen_record_time = {}
+            for record in dated:
+                self._seen_record_time[record.pet_id] = record.record_time
+            self._records_baseline = dated[-1].record_time if dated else 0
+            return 0
+
+        seen = self._seen_record_time
+        new = 0
+        for record in dated:
+            pet_id, record_time = record.pet_id, record.record_time
+            if record_time <= seen.get(pet_id, self._records_baseline):
+                continue
+            seen[pet_id] = record_time
+            new += 1
             usage = record.toilet_usage()
-            visits[pet_id] = PetVisit(
-                record=record,
-                weight_grams=usage.weight_grams if usage else None,
-                duration_seconds=usage.duration_seconds if usage else None,
-            )
-        data.pet_visits = visits
-        if self._pet_visits_loaded:
-            self._dispatch_new_visits(previous, visits)
-        self._pet_visits_loaded = True
-
-    def _dispatch_new_visits(
-        self, previous: dict[int, PetVisit], visits: dict[int, PetVisit]
-    ) -> None:
-        """Signal each pet whose latest record is newer than the last known one.
-
-        A pet with no previous visit only counts when its record is newer
-        than every record known before, so a newly listed pet does not
-        replay its history."""
-
-        baseline = max(
-            (v.record.record_time or 0 for v in previous.values()), default=0
-        )
-        for pet_id, visit in visits.items():
-            record_time = visit.record.record_time
-            if record_time is None:
-                continue
-            prev = previous.get(pet_id)
-            last_known = (
-                prev.record.record_time or 0 if prev is not None else baseline
-            )
-            if record_time <= last_known:
-                continue
+            if usage is None:
+                continue  # another record kind: not a visit
             attrs: dict[str, Any] = {
                 "pet_id": pet_id,
-                "weight_g": visit.weight_grams,
-                "duration_s": visit.duration_seconds,
+                "weight_g": usage.weight_grams,
+                "duration_s": usage.duration_seconds,
                 "record_time": dt_util.utc_from_timestamp(
                     record_time / 1000
                 ).isoformat(),
             }
-            if visit.record.dev_id:
-                attrs["device_id"] = visit.record.dev_id
+            if record.dev_id:
+                attrs["device_id"] = record.dev_id
             _LOGGER.debug("New visit recorded for pet %s: %s", pet_id, attrs)
             async_dispatcher_send(self.hass, signal_pet_visit(pet_id), attrs)
+        return new
 
     def cancel_record_fetch(self) -> None:
-        """Cancel a pending delayed record fetch (entry unload)."""
+        """Cancel a pending or running delayed record fetch (entry unload)."""
 
+        if self._record_fetch_timer is not None:
+            self._record_fetch_timer.cancel()
+            self._record_fetch_timer = None
         if self._record_fetch_task is not None:
             self._record_fetch_task.cancel()
             self._record_fetch_task = None
@@ -274,11 +300,19 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
     def _schedule_record_fetch(self) -> None:
         """Debounce + schedule a delayed record fetch after ``cat_left``."""
 
-        if self._record_fetch_task is not None:
-            self._record_fetch_task.cancel()
+        self.cancel_record_fetch()
         self._record_fetch_attempt = 0
-        self._record_fetch_task = self.hass.loop.call_later(
-            45, lambda: self.hass.async_create_task(self._fetch_pet_records())
+        self._arm_record_fetch()
+
+    def _arm_record_fetch(self) -> None:
+        self._record_fetch_timer = self.hass.loop.call_later(
+            45, self._start_record_fetch
+        )
+
+    def _start_record_fetch(self) -> None:
+        self._record_fetch_timer = None
+        self._record_fetch_task = self.hass.async_create_background_task(
+            self._fetch_pet_records(), "popur delayed pet record fetch"
         )
 
     async def _fetch_pet_records(self) -> None:
@@ -287,24 +321,14 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         if self.data is None:
             return
         self._record_fetch_attempt += 1
-        old_latest = max(
-            (v.record.record_time or 0 for v in self.data.pet_visits.values()),
-            default=0,
-        )
         try:
-            await self._refresh_pet_data(self.data)
+            new = await self._refresh_pet_data(self.data)
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("delayed pet record fetch failed: %s", err)
             return
-        new_latest = max(
-            (v.record.record_time or 0 for v in self.data.pet_visits.values()),
-            default=0,
-        )
-        if new_latest <= old_latest and self._record_fetch_attempt < 2:
+        if not new and self._record_fetch_attempt < 2:
             # Record hasn't landed in the cloud yet — retry once.
-            self._record_fetch_task = self.hass.loop.call_later(
-                45, lambda: self.hass.async_create_task(self._fetch_pet_records())
-            )
+            self._arm_record_fetch()
             return
         self.async_set_updated_data(self.data)
 

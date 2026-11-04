@@ -112,7 +112,7 @@ async def test_polling_never_triggers(
     await hass.async_block_till_done()
 
     assert fired == []
-    assert coordinator._record_fetch_task is None
+    assert coordinator._record_fetch_timer is None
 
 
 async def test_dp125_fault_appear_and_clear(
@@ -150,10 +150,10 @@ async def test_cat_left_schedules_record_fetch_and_fires_visit(
     await hass.async_block_till_done()
 
     assert [t for t, _ in _of(fired, activity_id)] == ["cat_left"]
-    assert coordinator._record_fetch_task is not None
+    assert coordinator._record_fetch_timer is not None
 
     # The delayed fetch finds a newer record → one visit event.
-    coordinator._record_fetch_task.cancel()
+    coordinator.cancel_record_fetch()
     popur.records.append(make_record(BASE_TIME_MS + 60_000, weight=4100, duration=45))
     await coordinator._fetch_pet_records()
     await hass.async_block_till_done()

@@ -180,9 +180,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
     )
     entry.runtime_data = entry_data
 
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     # Real-time push: decode MQTT frames into coordinator merges, and
-    # resync state on every (re)connect. The wire client is thread-based;
-    # hop onto the loop for state updates.
+    # resync state on every (re)connect. Connect only once the platforms
+    # are set up, so event entities already listen for the first push.
+    # The wire client is thread-based; hop onto the loop for state updates.
     try:
         local_keys = {
             dev.device_id: dev.local_key
@@ -208,14 +211,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> boo
         _LOGGER.warning("Popur realtime events unavailable, polling only: %s", err)
         entry_data.events = None
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: PopurConfigEntry) -> bool:
+    entry.runtime_data.coordinator.cancel_record_fetch()
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         data = entry.runtime_data
-        data.coordinator.cancel_record_fetch()
         if data.events is not None:
             try:
                 await data.events.close()
