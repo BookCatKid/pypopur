@@ -25,6 +25,7 @@ from pypopur.transport import FallbackTransport
 from .const import (
     CLOUD_REFRESH_INTERVAL,
     DOMAIN,
+    PET_RECORDS_MAX_PAGES,
     PET_RECORDS_PAGE_SIZE,
     signal_device_event,
     signal_pet_visit,
@@ -223,15 +224,13 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
             for pet in await self.account.pets(self.home_id):
                 pets[pet.pet_id] = pet
             data.pets = pets
-            page = await self.account.pet_records(
-                self.home_id, page_size=PET_RECORDS_PAGE_SIZE
-            )
+            records = await self._fetch_unseen_records()
 
-            # Latest record per pet; a pet whose records fell off this page
-            # keeps its previously known visit.
+            # Latest record per pet; a pet whose records fell off the fetched
+            # pages keeps its previously known visit.
             visits = dict(self._latest_visits)
             latest_on_page: set[int] = set()
-            for record in page.records:  # newest-first
+            for record in records:  # newest-first
                 pet_id = record.pet_id
                 if pet_id is None or pet_id in latest_on_page:
                     continue
@@ -244,7 +243,30 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
                 )
             self._latest_visits = visits
             data.pet_visits = visits
-            return self._dispatch_new_records(page.records)
+            return self._dispatch_new_records(records)
+
+    async def _fetch_unseen_records(self) -> list[PetRecord]:
+        """Fetch record pages (newest first) until one reaches already-seen
+        records, so a burst larger than a page is not skipped. The first
+        fetch only sets the baseline and reads a single page."""
+
+        records: list[PetRecord] = []
+        seen = self._seen_record_time
+        for page_no in range(1, PET_RECORDS_MAX_PAGES + 1):
+            page = await self.account.pet_records(
+                self.home_id, page_no=page_no, page_size=PET_RECORDS_PAGE_SIZE
+            )
+            records.extend(page.records)
+            if seen is None or not page.has_next or not page.records:
+                break
+            if any(
+                r.record_time is not None
+                and r.pet_id is not None
+                and r.record_time <= seen.get(r.pet_id, self._records_baseline)
+                for r in page.records
+            ):
+                break  # reached records we already know
+        return records
 
     def _dispatch_new_records(self, records: Sequence[PetRecord]) -> int:
         """Signal every toilet-usage record newer than the last one seen for

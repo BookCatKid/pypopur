@@ -113,9 +113,17 @@ class FakePopur:
         self.account.pet_records = AsyncMock(side_effect=self._records)
         self.account.connect_events = MagicMock(side_effect=self._connect_events)
 
-    async def _records(self, *_args: Any, **_kwargs: Any) -> PetRecordPage:
+    async def _records(
+        self, *_args: Any, page_no: int = 1, page_size: int = 20, **_kwargs: Any
+    ) -> PetRecordPage:
         newest_first = sorted(self.records, key=lambda r: r.record_time or 0, reverse=True)
-        return PetRecordPage(records=tuple(newest_first), total=len(newest_first), has_next=False)
+        start = (page_no - 1) * page_size
+        rows = newest_first[start : start + page_size]
+        return PetRecordPage(
+            records=tuple(rows),
+            total=len(newest_first),
+            has_next=start + page_size < len(newest_first),
+        )
 
     def _connect_events(self, *, devices, on_event, on_connect) -> FakeEvents:
         self.events = FakeEvents(on_event, on_connect, self._on_connected)

@@ -20,7 +20,9 @@ Every line of the output file is one JSON record with a ``kind``:
 - ``status``: login/connect/subscribe/heartbeat/close milestones.
 
 Secrets are masked: password/localKey/sid/ecode are never written, devId
-and uid keep their last 4 characters only.
+and uid keep their last 4 characters only. JSON payloads are parsed so
+secret-named keys are redacted too. Output directories are created 0700
+and capture files 0600 (owner only).
 """
 
 from __future__ import annotations
@@ -52,8 +54,13 @@ def read_secret_file(path: str | None, env: str) -> str:
     return Path(path).expanduser().read_text().strip()
 
 
+def private_dir(path: Path) -> None:
+    """Create ``path`` (owner-only if we create it)."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
 def stable_install_id() -> str:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    private_dir(CACHE_DIR)
     path = CACHE_DIR / "install_id"
     if path.exists():
         return path.read_text().strip()
@@ -109,7 +116,11 @@ def _payload_view(payload: bytes | None) -> dict[str, Any]:
     try:
         text = payload.decode("utf-8")
         if text.isprintable() or text.lstrip().startswith("{"):
-            return {"payload_text": text}
+            try:
+                # Parsed, so Masker redacts secret-named keys as well.
+                return {"payload_json": json.loads(text)}
+            except ValueError:
+                return {"payload_text": text}
     except UnicodeDecodeError:
         pass
     return {
@@ -153,7 +164,9 @@ class Recorder:
         self.path = path
         self.mask = masker
         self._lock = threading.Lock()
-        self._fh = path.open("a", encoding="utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)  # also tighten a pre-existing file
+        self._fh = os.fdopen(fd, "a", encoding="utf-8")
         self.counts: dict[str, int] = {}
         self._local = threading.local()
 
@@ -197,10 +210,10 @@ async def main() -> None:
 
     out = Path(args.out).expanduser()
     if out.suffix != ".jsonl":
-        out.mkdir(parents=True, exist_ok=True)
+        private_dir(out)
         out = out / f"capture-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
     else:
-        out.parent.mkdir(parents=True, exist_ok=True)
+        private_dir(out.parent)
 
     masker = Masker()
     masker.redact(password)

@@ -61,6 +61,34 @@ async def test_every_new_record_fires_oldest_first(
     assert [a["weight_g"] for _, a in visits] == [4100, 4200]
 
 
+async def test_burst_larger_than_a_page_fires_every_record(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    popur.records += [
+        make_record(BASE_TIME_MS + i * 60_000, weight=4000 + i) for i in range(1, 31)
+    ]
+    await _slow_refresh(hass, coordinator)
+
+    assert [a["weight_g"] for _, a in visits] == [4000 + i for i in range(1, 31)]
+    pages = [c.kwargs["page_no"] for c in popur.account.pet_records.await_args_list[-2:]]
+    assert pages == [1, 2]
+
+
+async def test_paging_stops_at_known_records(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    # A long history the integration has already seen, plus one new record.
+    popur.records += [make_record(BASE_TIME_MS - i * 60_000) for i in range(1, 60)]
+    popur.records.append(make_record(BASE_TIME_MS + 60_000))
+    popur.account.pet_records.reset_mock()
+    await _slow_refresh(hass, coordinator)
+
+    assert len(visits) == 1
+    assert [c.kwargs["page_no"] for c in popur.account.pet_records.await_args_list] == [1]
+
+
 async def test_non_toilet_usage_record_does_not_fire(
     hass: HomeAssistant, popur: FakePopur, setup_entry, visits
 ) -> None:
