@@ -211,3 +211,126 @@ async def test_mqtt_connects_after_event_entities_exist(
     hass: HomeAssistant, popur: FakePopur, setup_entry
 ) -> None:
     assert popur.event_entities_at_connect, "MQTT connected before event entities"
+
+
+
+async def _run_scheduled_record_fetch(hass: HomeAssistant, coordinator) -> None:
+    """Fire the actual delayed-fetch callback without waiting 45 real seconds."""
+    timer = coordinator._record_fetch_timer
+    assert timer is not None and not timer.cancelled()
+    timer.cancel()
+    coordinator._record_fetch_timer = None
+    coordinator._start_record_fetch()
+    await hass.async_block_till_done()
+
+
+async def test_first_delayed_fetch_with_visit_does_not_schedule_retry(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    popur.push({22: "cat_left"})
+    await hass.async_block_till_done()
+    assert coordinator._record_fetch_timer is not None
+
+    popur.records.append(make_record(BASE_TIME_MS + 60_000, weight=4150, duration=42))
+    previous_requests = popur.account.pet_records.await_count
+    await _run_scheduled_record_fetch(hass, coordinator)
+
+    assert popur.account.pet_records.await_count == previous_requests + 1
+    assert coordinator._record_fetch_attempt == 1
+    assert coordinator._record_fetch_timer is None
+    assert [(entity, attrs["weight_g"], attrs["duration_s"]) for entity, attrs in visits] == [
+        (_visit_entity(hass, PET_ID), 4150, 42)
+    ]
+
+
+async def test_second_delayed_fetch_finds_visit_after_non_visit(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    popur.push({22: "cat_left"})
+    await hass.async_block_till_done()
+
+    popur.records.append(make_record(BASE_TIME_MS + 60_000, dp_code="weight_data"))
+    previous_requests = popur.account.pet_records.await_count
+    await _run_scheduled_record_fetch(hass, coordinator)
+
+    assert popur.account.pet_records.await_count == previous_requests + 1
+    assert visits == []
+    assert coordinator._record_fetch_attempt == 1
+    assert coordinator._record_fetch_timer is not None
+
+    popur.records.append(make_record(BASE_TIME_MS + 120_000, weight=4250, duration=50))
+    await _run_scheduled_record_fetch(hass, coordinator)
+
+    assert popur.account.pet_records.await_count == previous_requests + 2
+    assert coordinator._record_fetch_attempt == 2
+    assert coordinator._record_fetch_timer is None
+    assert [(attrs["weight_g"], attrs["duration_s"]) for _, attrs in visits] == [(4250, 50)]
+    assert coordinator.data.pet_visits[PET_ID].record.record_time == BASE_TIME_MS + 120_000
+
+
+async def test_non_visit_refresh_preserves_sensor_values_until_next_visit(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    registry = er.async_get(hass)
+    weight_id = registry.async_get_entity_id("sensor", "popur", f"pet_{PET_ID}_last_weight")
+    duration_id = registry.async_get_entity_id(
+        "sensor", "popur", f"pet_{PET_ID}_last_visit_duration"
+    )
+    time_id = registry.async_get_entity_id("sensor", "popur", f"pet_{PET_ID}_last_visit")
+    assert weight_id is not None and duration_id is not None and time_id is not None
+
+    popur.records.append(make_record(BASE_TIME_MS + 60_000, weight=4300, duration=45))
+    await _slow_refresh(hass, coordinator)
+    initial_weight = hass.states.get(weight_id)
+    initial_duration = hass.states.get(duration_id)
+    initial_time = hass.states.get(time_id)
+    # HA converts the sensor's native grams to its suggested kilograms.
+    assert initial_weight is not None and float(initial_weight.state) == 4.3
+    assert initial_weight.attributes["unit_of_measurement"] == "kg"
+    assert initial_duration is not None and float(initial_duration.state) == 45
+    assert initial_time is not None and initial_time.state != STATE_UNKNOWN
+
+    # A newer weight_data record must not erase the last measured toilet visit.
+    popur.records.append(make_record(BASE_TIME_MS + 120_000, dp_code="weight_data"))
+    await _slow_refresh(hass, coordinator)
+    assert hass.states.get(weight_id).state == initial_weight.state
+    assert hass.states.get(duration_id).state == initial_duration.state
+    assert hass.states.get(time_id).state == initial_time.state
+    assert [attrs["weight_g"] for _, attrs in visits] == [4300]
+
+    # A subsequent actual visit must still update the sensors and emit an event.
+    popur.records.append(make_record(BASE_TIME_MS + 180_000, weight=4550, duration=55))
+    await _slow_refresh(hass, coordinator)
+    assert float(hass.states.get(weight_id).state) == 4.55
+    assert float(hass.states.get(duration_id).state) == 55
+    assert hass.states.get(time_id).state != initial_time.state
+    assert [attrs["weight_g"] for _, attrs in visits] == [4300, 4550]
+
+
+async def test_repeated_refreshes_do_not_replay_or_modify_visit_event(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    visit_id = _visit_entity(hass, PET_ID)
+    assert visit_id is not None
+    popur.records.append(make_record(BASE_TIME_MS + 60_000, weight=4400, duration=39))
+    await _slow_refresh(hass, coordinator)
+
+    first_state = hass.states.get(visit_id)
+    assert first_state is not None and first_state.state != STATE_UNKNOWN
+    assert first_state.attributes["event_type"] == "visit_recorded"
+    assert first_state.attributes["weight_g"] == 4400
+    assert [attrs["weight_g"] for _, attrs in visits] == [4400]
+
+    for _ in range(3):
+        await _slow_refresh(hass, coordinator)
+
+    final_state = hass.states.get(visit_id)
+    assert final_state is not None
+    assert final_state.state == first_state.state
+    assert final_state.attributes == first_state.attributes
+    assert [attrs["weight_g"] for _, attrs in visits] == [4400]
+    assert coordinator._seen_record_time[PET_ID] == BASE_TIME_MS + 60_000
