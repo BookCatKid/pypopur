@@ -217,7 +217,7 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         """Fetch latest pet profiles + records into ``data``.
 
         Signals one ``visit_recorded`` per new toilet-usage record and
-        returns the number of new records seen (of any kind)."""
+        returns the number of new visits dispatched."""
 
         async with self._pet_lock:
             pets: dict[int, Pet] = {}
@@ -234,12 +234,14 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
                 pet_id = record.pet_id
                 if pet_id is None or pet_id in latest_on_page:
                     continue
-                latest_on_page.add(pet_id)
                 usage = record.toilet_usage()
+                if usage is None:
+                    continue
+                latest_on_page.add(pet_id)
                 visits[pet_id] = PetVisit(
                     record=record,
-                    weight_grams=usage.weight_grams if usage else None,
-                    duration_seconds=usage.duration_seconds if usage else None,
+                    weight_grams=usage.weight_grams,
+                    duration_seconds=usage.duration_seconds,
                 )
             self._latest_visits = visits
             data.pet_visits = visits
@@ -291,10 +293,10 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
             if record_time <= seen.get(pet_id, self._records_baseline):
                 continue
             seen[pet_id] = record_time
-            new += 1
             usage = record.toilet_usage()
             if usage is None:
                 continue  # another record kind: not a visit
+            new += 1
             attrs: dict[str, Any] = {
                 "pet_id": pet_id,
                 "weight_g": usage.weight_grams,
@@ -338,7 +340,7 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         )
 
     async def _fetch_pet_records(self) -> None:
-        """Fetch records ~45 s after cat_left; retry once if no new record."""
+        """Fetch records ~45 s after cat_left; retry once if no new visit."""
 
         if self.data is None:
             return

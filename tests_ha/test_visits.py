@@ -99,6 +99,40 @@ async def test_non_toilet_usage_record_does_not_fire(
     assert visits == []
 
 
+async def test_non_visit_during_delayed_fetch_still_retries(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    # A different cloud record arrives before the delayed toilet-usage record.
+    popur.records.append(make_record(BASE_TIME_MS + 60_000, dp_code="weight_data"))
+
+    await coordinator._fetch_pet_records()
+    await hass.async_block_till_done()
+
+    assert visits == []
+    assert coordinator._record_fetch_attempt == 1
+    assert coordinator._record_fetch_timer is not None
+
+
+async def test_newer_non_visit_does_not_replace_latest_toilet_visit(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    popur.records.extend(
+        [
+            make_record(BASE_TIME_MS + 60_000, weight=4200),
+            make_record(BASE_TIME_MS + 120_000, dp_code="weight_data"),
+        ]
+    )
+
+    await _slow_refresh(hass, coordinator)
+
+    latest = coordinator.data.pet_visits[PET_ID]
+    assert latest.record.record_time == BASE_TIME_MS + 60_000
+    assert latest.weight_grams == 4200
+    assert [attrs["weight_g"] for _, attrs in visits] == [4200]
+
+
 async def test_overlapping_fetches_fire_once(
     hass: HomeAssistant, popur: FakePopur, setup_entry, visits
 ) -> None:
