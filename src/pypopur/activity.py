@@ -41,7 +41,7 @@ class ActivityEvent:
     event_type: str
     dp: int
     raw_value: Any
-    attributes: Mapping[str, Any] = field(default=_EMPTY)
+    attributes: Mapping[str, Any] = field(default_factory=lambda: _EMPTY)
 
 
 def _activity_events(value: Any) -> list[ActivityEvent]:
