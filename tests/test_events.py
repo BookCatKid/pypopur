@@ -524,9 +524,13 @@ class WireTests(unittest.TestCase):
             _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
             _wait_for(lambda: connects == [1])
             broker.subscribed.clear()
-            broker.conn.close()  # simulate link loss
-            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed, timeout=30)
-            _wait_for(lambda: len(connects) >= 2, timeout=30)
+            # Simulate link loss. shutdown() actually sends the FIN — a bare
+            # close() while the serve thread sits in recv() does not, and the
+            # client would only notice through a read timeout.
+            broker.conn.shutdown(socket.SHUT_RDWR)
+            broker.conn.close()
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
+            _wait_for(lambda: len(connects) >= 2)
             self.assertIn("p2603060/mb/u123", broker.subscribed)
         finally:
             asyncio.run(ev.close())

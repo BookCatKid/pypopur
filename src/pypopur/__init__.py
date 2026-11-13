@@ -1,7 +1,13 @@
 """Async local-first Popur S7 library for firmware 4.x/app-v2."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.3"
 
+from .activity import (
+    ACTIVITY_EVENT_TYPES,
+    FAULT_EVENT_TYPES,
+    ActivityEvent,
+    extract_activity_events,
+)
 from .bootstrap import LocalConfigBootstrap, resolve_local_config
 from .client import PopurClient
 from .cloud import (
@@ -160,11 +166,13 @@ from .transport import FallbackTransport, PopurTransport
 from .writes import TimerInstruction, build_instruct, pet_json, pet_query_json
 
 __all__ = [
+    "ACTIVITY_EVENT_TYPES",
     "DP_ALIASES",
     "DP_ALIAS_COUNT",
     "DP_DISTINCT_VALUE_COUNT",
     "DP_VALUE_ALIASES",
     "DP_VALUE_STATUS",
+    "FAULT_EVENT_TYPES",
     "FAULT_ITEMS",
     "NOTIFICATION_DP_IDS",
     "PACKED_DP_IDS",
@@ -179,6 +187,7 @@ __all__ = [
     "AccountDevice",
     "AccountDeviceNotFound",
     "ActiveShieldSettings",
+    "ActivityEvent",
     "AtopCloudBackend",
     "AuthenticationError",
     "BinStatus",
@@ -287,6 +296,7 @@ __all__ = [
     "encode_dp106",
     "encode_notification_settings",
     "encrypt_mobile_payload",
+    "extract_activity_events",
     "extract_apk_signing_certificate_sha256",
     "extract_popur_app2_build_config",
     "extract_thing_security_components",
