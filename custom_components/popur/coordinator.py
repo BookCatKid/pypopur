@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -27,6 +31,7 @@ from .const import (
     DOMAIN,
     PET_RECORDS_MAX_PAGES,
     PET_RECORDS_PAGE_SIZE,
+    PET_VISITS_PENDING_MAX,
     signal_device_event,
     signal_pet_visit,
 )
@@ -105,6 +110,12 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         # count records newer than it, so they do not replay their history.
         self._records_baseline = 0
         self._latest_visits: dict[int, PetVisit] = {}
+        # Visit entities currently subscribed, per pet (see
+        # ``async_subscribe_visits``), and visits held for household pets
+        # with none yet — a new pet's entity is only created after the
+        # refresh that found it and its first visit.
+        self._visit_subscribers: dict[int, int] = {}
+        self._pending_visits: dict[int, deque[dict[str, Any]]] = {}
 
     def transport_state(self, dev_id: str) -> str:
         """Which channel last served this device: ``lan`` or ``cloud``."""
@@ -217,14 +228,18 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
         """Fetch latest pet profiles + records into ``data``.
 
         Signals one ``visit_recorded`` per new toilet-usage record and
-        returns the number of new visits dispatched."""
+        returns the number of new visits found."""
 
         async with self._pet_lock:
             pets: dict[int, Pet] = {}
             for pet in await self.account.pets(self.home_id):
                 pets[pet.pet_id] = pet
             data.pets = pets
-            records = await self._fetch_unseen_records()
+            # Visits held for a pet that left the household will never be
+            # claimed by an entity.
+            for pet_id in [p for p in self._pending_visits if p not in pets]:
+                del self._pending_visits[pet_id]
+            records = await self._fetch_unseen_records(pets)
 
             # Latest record per pet; a pet whose records fell off the fetched
             # pages keeps its previously known visit.
@@ -245,34 +260,59 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
                 )
             self._latest_visits = visits
             data.pet_visits = visits
-            return self._dispatch_new_records(records)
+            return self._dispatch_new_records(records, pets)
 
-    async def _fetch_unseen_records(self) -> list[PetRecord]:
-        """Fetch record pages (newest first) until one reaches already-seen
-        records, so a burst larger than a page is not skipped. The first
-        fetch only sets the baseline and reads a single page."""
+    async def _fetch_unseen_records(self, pet_ids: Collection[int]) -> list[PetRecord]:
+        """Fetch record pages (newest first) until they reach back to the
+        last seen record of every pet in ``pet_ids``, so neither a burst
+        larger than a page nor an older unseen record of another pet is
+        skipped. The first fetch only sets the baseline and reads a single
+        page.
+
+        Pages are ordered by time household-wide, so once the oldest record
+        fetched is at or below the lowest watermark of the current pets, no
+        later page can hold a record newer than any of them. A pet that has
+        been inactive while others were busy keeps its watermark deep in
+        history and makes each refresh read more pages, up to
+        ``PET_RECORDS_MAX_PAGES``. Pets no longer in the household do not
+        hold paging open."""
 
         records: list[PetRecord] = []
         seen = self._seen_record_time
+        if seen is None:
+            floor = None
+        else:
+            floor = min(
+                (seen.get(pet_id, self._records_baseline) for pet_id in pet_ids),
+                default=None,
+            )
         for page_no in range(1, PET_RECORDS_MAX_PAGES + 1):
             page = await self.account.pet_records(
                 self.home_id, page_no=page_no, page_size=PET_RECORDS_PAGE_SIZE
             )
             records.extend(page.records)
-            if seen is None or not page.has_next or not page.records:
+            if floor is None or not page.has_next or not page.records:
                 break
-            if any(
-                r.record_time is not None
-                and r.pet_id is not None
-                and r.record_time <= seen.get(r.pet_id, self._records_baseline)
-                for r in page.records
-            ):
-                break  # reached records we already know
+            # Records without a time say nothing about how far back the page
+            # goes; records without a pet still do.
+            oldest = min(
+                (r.record_time for r in page.records if r.record_time is not None),
+                default=None,
+            )
+            if oldest is not None and oldest <= floor:
+                break  # every current pet's unseen records are fetched
         return records
 
-    def _dispatch_new_records(self, records: Sequence[PetRecord]) -> int:
+    def _dispatch_new_records(
+        self, records: Sequence[PetRecord], pet_ids: Collection[int]
+    ) -> int:
         """Signal every toilet-usage record newer than the last one seen for
-        its pet, oldest first; advance the per-pet watermarks."""
+        its pet, oldest first; advance the per-pet watermarks.
+
+        A visit of a household pet (``pet_ids``) whose visit entity is not
+        subscribed yet (it is created after this refresh when the pet is
+        new) is held until the entity subscribes, so it is not lost.
+        Returns the number of new visits, delivered or held."""
 
         dated = sorted(
             (r for r in records if r.pet_id is not None and r.record_time is not None),
@@ -308,8 +348,47 @@ class PopurCoordinator(DataUpdateCoordinator[PopurRuntimeData]):
             if record.dev_id:
                 attrs["device_id"] = record.dev_id
             _LOGGER.debug("New visit recorded for pet %s: %s", pet_id, attrs)
-            async_dispatcher_send(self.hass, signal_pet_visit(pet_id), attrs)
+            if self._visit_subscribers.get(pet_id):
+                async_dispatcher_send(self.hass, signal_pet_visit(pet_id), attrs)
+            elif pet_id in pet_ids:
+                self._pending_visits.setdefault(
+                    pet_id, deque(maxlen=PET_VISITS_PENDING_MAX)
+                ).append(attrs)
         return new
+
+    @callback
+    def async_subscribe_visits(
+        self, pet_id: int, handler: Callable[[Mapping[str, Any]], None]
+    ) -> CALLBACK_TYPE:
+        """Connect ``handler`` to one pet's visits, first replaying the
+        visits held for it, oldest first. Returns the unsubscribe callback.
+
+        Each visit reaches a handler exactly once: it is either sent on the
+        dispatcher signal (a handler is subscribed) or held until one is."""
+
+        disconnect = async_dispatcher_connect(
+            self.hass, signal_pet_visit(pet_id), handler
+        )
+        self._visit_subscribers[pet_id] = self._visit_subscribers.get(pet_id, 0) + 1
+        for attrs in self._pending_visits.pop(pet_id, ()):
+            handler(attrs)
+
+        @callback
+        def _unsubscribe() -> None:
+            disconnect()
+            remaining = self._visit_subscribers.get(pet_id, 0) - 1
+            if remaining > 0:
+                self._visit_subscribers[pet_id] = remaining
+            else:
+                self._visit_subscribers.pop(pet_id, None)
+
+        return _unsubscribe
+
+    async def async_shutdown(self) -> None:
+        """Drop held visits on entry unload."""
+
+        await super().async_shutdown()
+        self._pending_visits.clear()
 
     def cancel_record_fetch(self) -> None:
         """Cancel a pending or running delayed record fetch (entry unload)."""

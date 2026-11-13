@@ -17,8 +17,12 @@ MIN_SCAN_INTERVAL: Final = timedelta(seconds=15)
 CLOUD_REFRESH_INTERVAL: Final = timedelta(minutes=10)
 
 PET_RECORDS_PAGE_SIZE: Final = 25
-# Pages followed per refresh while they still hold unseen records.
+# Pages followed per refresh until they reach every household pet's last
+# seen record.
 PET_RECORDS_MAX_PAGES: Final = 4
+# New visits held per pet until its visit entity subscribes (a pet and its
+# first visit can show up in the same refresh); the oldest are dropped past it.
+PET_VISITS_PENDING_MAX: Final = 20
 
 # Dispatcher signals for the event platform. Activity/fault events are sent
 # per device with ``(ActivityEvent, attributes)``; pet visits per pet with

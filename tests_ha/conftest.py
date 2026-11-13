@@ -166,8 +166,9 @@ async def setup_entry(hass: HomeAssistant, popur: FakePopur):
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    yield entry
+    # Unloading drops ``runtime_data``; a test may unload the entry itself.
     coordinator = entry.runtime_data.coordinator
+    yield entry
     coordinator.cancel_record_fetch()
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

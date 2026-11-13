@@ -19,7 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pypopur.activity import ACTIVITY_EVENT_TYPES, FAULT_EVENT_TYPES, ActivityEvent
 
 from . import PopurConfigEntry
-from .const import EVENT_TYPE_VISIT_RECORDED, signal_device_event, signal_pet_visit
+from .const import EVENT_TYPE_VISIT_RECORDED, signal_device_event
 from .entity import PopurEntity, PopurPetEntity
 
 
@@ -128,9 +128,18 @@ class PopurPetVisitEvent(PopurPetEntity, EventEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        # State writes are ignored until the entity is fully added, right
+        # after this returns: subscribe then, so each visit held for this
+        # pet (e.g. its first one, found in the refresh that created this
+        # entity) is written as its own state change.
+        handle = self.hass.loop.call_soon(self._async_subscribe_visits)
+        self.async_on_remove(handle.cancel)
+
+    @callback
+    def _async_subscribe_visits(self) -> None:
         self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass, signal_pet_visit(self.pet_id), self._async_handle_visit
+            self.coordinator.async_subscribe_visits(
+                self.pet_id, self._async_handle_visit
             )
         )
 

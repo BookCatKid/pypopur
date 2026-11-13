@@ -9,9 +9,10 @@ from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 
+from custom_components.popur.const import PET_VISITS_PENDING_MAX
 from pypopur.reads import Pet
 
-from .conftest import BASE_TIME_MS, PET_ID, FakePopur, make_record
+from .conftest import BASE_TIME_MS, DEV_ID, PET_ID, FakePopur, make_record
 
 OTHER_PET_ID = 8
 
@@ -179,6 +180,101 @@ async def test_pet_added_later_gets_a_visit_entity(
     popur.records.append(make_record(BASE_TIME_MS + 60_000, pet_id=OTHER_PET_ID))
     await _slow_refresh(hass, coordinator)
     assert [e for e, _ in visits] == [entity_id]
+
+
+async def test_new_pet_first_visit_in_same_refresh_fires(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    # The pet and its first visit both show up in one refresh: the visit is
+    # found before the pet's entity exists.
+    popur.pets.append(Pet.from_json({"id": OTHER_PET_ID, "name": "Felix"}))
+    popur.records.append(
+        make_record(BASE_TIME_MS + 60_000, pet_id=OTHER_PET_ID, weight=3900, duration=30)
+    )
+    await _slow_refresh(hass, coordinator)
+
+    entity_id = _visit_entity(hass, OTHER_PET_ID)
+    assert entity_id is not None
+    [(fired_id, attrs)] = visits
+    assert fired_id == entity_id
+    assert attrs["event_type"] == "visit_recorded"
+    assert attrs["pet_id"] == OTHER_PET_ID
+    assert attrs["weight_g"] == 3900
+    assert attrs["duration_s"] == 30
+    assert attrs["device_id"] == DEV_ID
+    assert attrs["record_time"].startswith("2026-11-03T")
+    assert coordinator._pending_visits == {}
+
+    # Delivered once: not replayed, and later visits arrive live.
+    await _slow_refresh(hass, coordinator)
+    popur.records.append(make_record(BASE_TIME_MS + 120_000, pet_id=OTHER_PET_ID, weight=3950))
+    await _slow_refresh(hass, coordinator)
+    assert [(e, a["weight_g"]) for e, a in visits] == [(entity_id, 3900), (entity_id, 3950)]
+
+
+async def test_held_visits_each_fire_oldest_first(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    popur.pets.append(Pet.from_json({"id": OTHER_PET_ID, "name": "Felix"}))
+    popur.records += [
+        make_record(BASE_TIME_MS + 120_000, pet_id=OTHER_PET_ID, weight=3920),
+        make_record(BASE_TIME_MS + 60_000, pet_id=OTHER_PET_ID, weight=3910),
+    ]
+    await _slow_refresh(hass, coordinator)
+
+    entity_id = _visit_entity(hass, OTHER_PET_ID)
+    assert [(e, a["weight_g"]) for e, a in visits] == [(entity_id, 3910), (entity_id, 3920)]
+
+
+async def test_held_visits_are_bounded_and_dropped_with_the_pet(
+    hass: HomeAssistant, popur: FakePopur, setup_entry
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    records = [
+        make_record(BASE_TIME_MS + i * 60_000, pet_id=99, weight=3000 + i)
+        for i in range(1, PET_VISITS_PENDING_MAX + 6)
+    ]
+    # A household pet that has no visit entity: its newest visits are held.
+    assert coordinator._dispatch_new_records(records, {PET_ID, 99}) == len(records)
+    assert [a["weight_g"] for a in coordinator._pending_visits[99]] == [
+        r.toilet_usage().weight_grams for r in records[-PET_VISITS_PENDING_MAX:]
+    ]
+    # Not in the household: nothing to hold them for.
+    popur.records.append(make_record(BASE_TIME_MS + 600_000_000, pet_id=98))
+    await _slow_refresh(hass, coordinator)
+    assert coordinator._pending_visits == {}
+
+
+async def test_removed_visit_entity_unsubscribes(
+    hass: HomeAssistant, popur: FakePopur, setup_entry, visits
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    entity_id = _visit_entity(hass, PET_ID)
+    assert coordinator._visit_subscribers == {PET_ID: 1}
+
+    er.async_get(hass).async_remove(entity_id)
+    await hass.async_block_till_done()
+    assert coordinator._visit_subscribers == {}
+
+    popur.records.append(make_record(BASE_TIME_MS + 60_000, weight=4100))
+    await _slow_refresh(hass, coordinator)
+    assert visits == []
+    assert [a["weight_g"] for a in coordinator._pending_visits[PET_ID]] == [4100]
+
+
+async def test_unload_drops_held_visits(
+    hass: HomeAssistant, popur: FakePopur, setup_entry
+) -> None:
+    coordinator = setup_entry.runtime_data.coordinator
+    coordinator._dispatch_new_records([make_record(BASE_TIME_MS + 60_000, pet_id=99)], {99})
+    assert coordinator._pending_visits
+
+    assert await hass.config_entries.async_unload(setup_entry.entry_id)
+    await hass.async_block_till_done()
+    assert coordinator._pending_visits == {}
+    assert coordinator._visit_subscribers == {}
 
 
 async def test_unload_cancels_running_fetch(
