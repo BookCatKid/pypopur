@@ -15,7 +15,7 @@
 - **Discovery** — passive UDP announcements plus active host location via ARP MAC match and port-6668 subnet scan
 - **DP codecs** — all firmware-4 packed payloads decoded (settings, calibration, radar config, cat weight, visit records)
 - **Pet tracking** — household pet profiles, per-visit weight/duration records decoded from the app's own format
-- **Home Assistant integration** — full entity coverage (sensors, switches, buttons, numbers, selects) in `custom_components/popur/`
+- **Home Assistant** — this SDK powers the separate [Popur S7 Home Assistant integration](https://github.com/BookCatKid/popur-s7-ha)
 
 ## Install
 
@@ -118,7 +118,7 @@ await events.connect()
 
 ## Home Assistant
 
-The integration lives in `custom_components/popur/` — install via HACS custom repository or copy the directory to your HA `custom_components/`. See [`custom_components/popur/README.md`](custom_components/popur/README.md) for details.
+[Popur S7 for Home Assistant](https://github.com/BookCatKid/popur-s7-ha) uses `pypopur` as its Python SDK for device communication, discovery, MQTT, and cloud APIs. The Home Assistant integration is maintained in that separate repository, not here. For installation and configuration, see its [README](https://github.com/BookCatKid/popur-s7-ha#readme). Its Home Assistant domain is `popur_s7`.
 
 ## Status
 
