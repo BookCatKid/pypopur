@@ -58,3 +58,22 @@ No action or settings write was sent during live verification. Action encodings 
 the official App-2 APK and synthetic transport tests. Packed settings writes preserve unknown and
 reserved bytes, and targeted mutations refuse to proceed when the current packed payload is not
 available.
+
+## Activity and fault events
+
+`pypopur.extract_activity_events(dps, previous_raw=None)` turns one received DP report into a
+list of `ActivityEvent(event_type, dp, raw_value, attributes)`. It is a pure function: the caller
+timestamps events at reception and decides which frames to feed it (live MQTT pushes, not polled
+or refreshed snapshots, otherwise the current state would be replayed).
+
+- **DP22 is the only activity trigger.** A live MQTT capture (firmware pv 2.3) showed DP22 arrives
+  as a string (`cat_exist`, `cat_done_business`, `cleaning_started`, `manual_clean_completed`, …),
+  once per real event, one DP per frame, with no `dpsTime`. Every DP22 yields an event, even when
+  it repeats the previous value. `idle` and unknown values yield nothing. Event types are listed
+  in `ACTIVITY_EVENT_TYPES` (the non-idle `RecentActivity` names in lower case).
+- **DP101 never yields events.** The firmware re-sends it unchanged and once per countdown minute.
+- **DP125** yields one `fault_detected` / `fault_cleared` per bit that changed against
+  `previous_raw[125]`, with `attributes = {"fault", "url", "mask"}` (`FAULT_EVENT_TYPES`). Without a
+  previous mask nothing is emitted, to avoid spurious events at startup. DP125 has not been
+  observed live yet.
+- Cloud protocol-56 alerts (push-notification rules) duplicate DP22 and are out of scope.

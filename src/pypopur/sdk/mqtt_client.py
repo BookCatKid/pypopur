@@ -156,6 +156,13 @@ class MqttWireClient:
             ctx = ssl.create_default_context()
         return ctx.wrap_socket(raw, server_hostname=host)
 
+    @property
+    def read_timeout(self) -> float:
+        """Post-CONNACK socket read timeout — 1.5×keepAlive, so a regular
+        PINGREQ/PINGRESP exchange always lands inside it."""
+
+        return max(float(self.config.time_out), float(self.config.keep_alive) * 1.5)
+
     def _next_packet_id(self) -> int:
         self._packet_id = (self._packet_id + 1) & 0xFFFF
         if self._packet_id == 0:
@@ -220,6 +227,14 @@ class MqttWireClient:
             rc = body[1]
             if rc != 0:
                 raise MqttConnectError(rc)
+            # ``time_out`` bounds the TCP/TLS handshake + CONNACK only. Once
+            # the session is up the reader blocks between pushes; keeping
+            # the handshake timeout there drops the link after every quiet
+            # ``time_out`` window (pings only go out at 0.9×keepAlive).
+            # Allow one missed PINGRESP before declaring the link dead.
+            settimeout = getattr(sock, "settimeout", None)
+            if settimeout is not None:
+                settimeout(self.read_timeout)
         except Exception as e:
             self._notify_connect_error(
                 str(e.code if isinstance(e, MqttConnectError) else -1), str(e)

@@ -337,3 +337,45 @@ def test_publish_device_offline_error() -> None:
     cb = Cb()
     manager.publish_device(object(), cb)  # non-null builder
     assert cb.error == ("6000", "mqtt is not connect")
+
+
+def test_idle_session_outlives_handshake_timeout() -> None:
+    """Regression: the handshake ``time_out`` used to stay on the socket,
+    so the reader timed out after every quiet window and reconnected
+    (~every 16 s live), dropping pushes in the gap."""
+
+    broker = FakeBroker()
+    manager = MqttServerManager("t-idle")
+    config = MqttConfigBean(
+        client_id="pkg_mb_dev-tag_tag",
+        host="127.0.0.1",
+        port=broker.port,
+        keep_alive=60,
+        time_out=0.2,  # handshake timeout far below the idle window
+    )
+
+    class Creds:
+        def username(self) -> str:
+            return "u"
+
+        def password(self) -> str:
+            return "p"
+
+        def user_topic(self) -> str:
+            return "pid/mb/uid"
+
+    client = MqttWireClient(
+        manager,
+        config,
+        Creds(),
+        sock_factory=lambda h, p, t: socket.create_connection((h, p), timeout=t),
+    )
+    try:
+        client.connect()
+        time.sleep(1.0)  # 5× the handshake timeout with no traffic
+        assert client.connected
+        assert broker.connect_count == 1
+        assert client.read_timeout == 90.0
+    finally:
+        client.close()
+        broker.stop()
