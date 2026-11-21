@@ -65,9 +65,9 @@ class CredentialsTests(unittest.TestCase):
 
     def test_username_formula(self) -> None:
         _, creds = build_mqtt_credentials(_Profile(), _Session())
-        inner = hashlib.md5(
-            hashlib.md5(b"testappid").hexdigest().encode() + b"ec00"
-        ).hexdigest()[-16:]
+        inner = hashlib.md5(hashlib.md5(b"testappid").hexdigest().encode() + b"ec00").hexdigest()[
+            -16:
+        ]
         self.assertEqual(
             creds.username(),
             f"p2603060_v1_testappid_chkey123_mb_s1d-t0k3n{inner}",
@@ -75,9 +75,7 @@ class CredentialsTests(unittest.TestCase):
 
     def test_password_uses_cmd2_centered16(self) -> None:
         _, creds = build_mqtt_credentials(_Profile(), _Session())
-        seed = hashlib.md5(
-            hashlib.md5(MASTER).hexdigest().encode() + b"ec00"
-        ).hexdigest()
+        seed = hashlib.md5(hashlib.md5(MASTER).hexdigest().encode() + b"ec00").hexdigest()
         self.assertEqual(len(seed), 32)
         self.assertEqual(creds.password(), seed[8:24])
 
@@ -231,11 +229,15 @@ class IngestSinkTests(unittest.TestCase):
         ingest, cache = self._ingest()
         sink = make_central_ingest_sink(ingest)
         listener = DeviceEventListener(
-            {"dev1": KEY}, ThingMessageCache(), lambda e: None,
-            user_topic="pid/mb/uid", dp_sink=sink,
+            {"dev1": KEY},
+            ThingMessageCache(),
+            lambda e: None,
+            user_topic="pid/mb/uid",
+            dp_sink=sink,
         )
         listener.on_mqtt_dp_received_success(
-            "smart/mb/in/dev1", 5,
+            "smart/mb/in/dev1",
+            5,
             {"data": {"devId": "dev1", "dps": {"1": True}, "dpsTime": {"1": 2000}}},
         )
         bean = cache.get_dev_resp_bean("dev1")
@@ -400,9 +402,7 @@ def _wait_for(pred, timeout: float = 5.0) -> None:
 class WireTests(unittest.TestCase):
     _tag_counter = 0
 
-    def _events_on_broker(
-        self, broker: FakeBroker, events: list[DeviceEvent]
-    ) -> PopurMqttEvents:
+    def _events_on_broker(self, broker: FakeBroker, events: list[DeviceEvent]) -> PopurMqttEvents:
         class S(_Session):
             domain: ClassVar[dict] = {"mobileMqttsUrl": "127.0.0.1", "mqttsPort": str(broker.port)}
 
@@ -446,9 +446,7 @@ class WireTests(unittest.TestCase):
 
             asyncio.run(ev.connect())
             _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
-            payload = build_payload_2_0(
-                KEY, "2.0", {"dps": {"1": True}}, "dev1", 5, 1700000000
-            )
+            payload = build_payload_2_0(KEY, "2.0", {"dps": {"1": True}}, "dev1", 5, 1700000000)
             broker.push("smart/mb/in/dev1", payload)
             _wait_for(lambda: len(events) == 1)
             self.assertEqual(events[0].dev_id, "dev1")
@@ -469,9 +467,7 @@ class WireTests(unittest.TestCase):
 
             asyncio.run(ev.connect())
             _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
-            payload = build_payload_2_0(
-                KEY, "2.0", {"dps": {"1": True}}, "dev1", 5, 1
-            )
+            payload = build_payload_2_0(KEY, "2.0", {"dps": {"1": True}}, "dev1", 5, 1)
             obj = json.loads(payload)
             obj["sign"] = "0" * 32
             broker.push("smart/mb/in/dev1", json.dumps(obj).encode())
@@ -507,7 +503,6 @@ class WireTests(unittest.TestCase):
             asyncio.run(ev.close())
             broker.stop()
 
-
     def test_reconnect_resubscribes_and_fires_on_connect(self) -> None:
         # Link loss → _link_lost → _try_reconnect → on_connect_success →
         # the desired topics are re-SUBSCRIBEd (clean session drops them)
@@ -517,6 +512,9 @@ class WireTests(unittest.TestCase):
         connects: list[int] = []
         ev = self._events_on_broker(broker, events)
         ev._on_connect = lambda: connects.append(1)
+        # The link drops right after connecting: a flap, so the client
+        # waits one backoff step first. Keep that short here.
+        ev.client._reconnect_backoff = (0.05, 0.2)
         try:
             import asyncio
 
@@ -532,6 +530,74 @@ class WireTests(unittest.TestCase):
             _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
             _wait_for(lambda: len(connects) >= 2)
             self.assertIn("p2603060/mb/u123", broker.subscribed)
+        finally:
+            asyncio.run(ev.close())
+            broker.stop()
+
+    def test_new_instance_with_same_tag_resubscribes(self) -> None:
+        # The per-tag MqttServerManager is a process-wide singleton. A
+        # second instance on the same tag (an integration reload) must
+        # still SUBSCRIBE on its fresh clean session, and the closed
+        # instance must no longer receive pushes.
+        import asyncio
+
+        broker = FakeBroker()
+        first_events: list[DeviceEvent] = []
+        first = self._events_on_broker(broker, first_events)
+        tag = first.manager.tag
+        try:
+            asyncio.run(first.connect())
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
+            asyncio.run(first.close())
+            broker.subscribed.clear()
+
+            class S(_Session):
+                domain: ClassVar[dict] = {
+                    "mobileMqttsUrl": "127.0.0.1",
+                    "mqttsPort": str(broker.port),
+                }
+
+            second_events: list[DeviceEvent] = []
+            second = PopurMqttEvents(
+                _Profile(),
+                S(),
+                "installid" * 3,
+                devices={"dev1": KEY},
+                on_event=second_events.append,
+                sock_factory=lambda h, p, t: socket.create_connection((h, p), timeout=t),
+                tag=tag,
+            )
+            self.assertIs(second.manager, first.manager)
+            asyncio.run(second.connect())
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
+            self.assertIn("p2603060/mb/u123", broker.subscribed)
+            self.assertNotIn(first.listener, second.manager.message_listeners)
+
+            payload = build_payload_2_0(
+                KEY, "2.0", {"dps": {"22": "cat_exist"}}, "dev1", 5, 1700000000
+            )
+            broker.push("smart/mb/in/dev1", payload)
+            _wait_for(lambda: len(second_events) == 1)
+            self.assertEqual(second_events[0].dps, {22: "cat_exist"})
+            self.assertEqual(first_events, [])
+            asyncio.run(second.close())
+        finally:
+            broker.stop()
+
+    def test_connect_again_subscribes_new_devices(self) -> None:
+        # A second connect() on a live session adds its devices' topics:
+        # no connect-success hook runs then, so connect() must SUBSCRIBE.
+        import asyncio
+
+        broker = FakeBroker()
+        events: list[DeviceEvent] = []
+        ev = self._events_on_broker(broker, events)
+        ev.register_device("dev2", KEY)
+        try:
+            asyncio.run(ev.connect(["dev1"]))
+            _wait_for(lambda: "smart/mb/in/dev1" in broker.subscribed)
+            asyncio.run(ev.connect(["dev2"]))
+            _wait_for(lambda: "smart/mb/in/dev2" in broker.subscribed)
         finally:
             asyncio.run(ev.close())
             broker.stop()

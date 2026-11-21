@@ -57,6 +57,40 @@ _DISCONNECT = 0xE0
 # pqpbdqq.isRealConnect — reconnect only when the last attempt is older.
 RECONNECT_MIN_INTERVAL_MS = 0x1D4C0  # 120_000
 
+# Retry delay after a link loss: first and maximum delay, in seconds,
+# doubling between attempts until the session is back.
+RECONNECT_BACKOFF_S = (5.0, 300.0)
+
+
+# A session that drops sooner than this after CONNACK is a flap: wait
+# before reconnecting instead of reconnecting at once.
+FLAP_WINDOW_S = 10.0
+
+
+# How long close() waits for a send in progress before it skips the
+# DISCONNECT packet and shuts the socket down anyway.
+CLOSE_SEND_WAIT_S = 1.0
+
+
+def _close_socket(sock: Any, disconnect: bytes | None = None) -> None:
+    """Best-effort DISCONNECT, shutdown (wakes a reader blocked in
+    ``recv``) and close."""
+    if sock is None:
+        return
+    if disconnect is not None:
+        try:
+            sock.sendall(disconnect)
+        except OSError:
+            pass
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, AttributeError):
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
 
 def _encode_remaining(n: int) -> bytes:
     out = bytearray()
@@ -120,12 +154,22 @@ class MqttWireClient:
         tls_context: ssl.SSLContext | None = None,
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
         reconnect_interval_ms: int = RECONNECT_MIN_INTERVAL_MS,
+        reconnect_backoff: tuple[float, float] = RECONNECT_BACKOFF_S,
     ) -> None:
         self.manager = manager
         self.config = config
         self.credentials = credentials
         self._clock_ms = clock_ms
         self._reconnect_interval = reconnect_interval_ms
+        self._reconnect_backoff = reconnect_backoff
+        self._connect_lock = threading.Lock()
+        # Guards _closing/_connected/_sock between close() and a connect
+        # that finishes its handshake; never held across network I/O.
+        self._state_lock = threading.Lock()
+        self._connected_at = 0.0
+        # Set by close(): stops the reconnect loop and the pinger's wait.
+        self._stop = threading.Event()
+        self._generation = 0
         self._sock_factory = sock_factory or self._default_sock_factory
         self._tls_context = tls_context
 
@@ -169,10 +213,11 @@ class MqttWireClient:
             self._packet_id = 1
         return self._packet_id
 
-    def _read_exact(self, n: int) -> bytes:
+    def _read_exact(self, n: int, sock: Any = None) -> bytes:
+        sock = sock if sock is not None else self._sock
         chunks = bytearray()
         while len(chunks) < n:
-            part = self._sock.recv(n - len(chunks))  # type: ignore[union-attr]
+            part = sock.recv(n - len(chunks))  # type: ignore[union-attr]
             if not part:
                 raise ConnectionError("socket closed")
             chunks.extend(part)
@@ -180,7 +225,10 @@ class MqttWireClient:
 
     def _send(self, packet: bytes) -> None:
         with self._send_lock:
-            self._sock.sendall(packet)  # type: ignore[union-attr]
+            sock = self._sock
+            if sock is None:
+                raise ConnectionError("mqtt is not connected")
+            sock.sendall(packet)
             self._last_tx = time.monotonic()
 
     def _packet(self, header: int, body: bytes = b"") -> bytes:
@@ -190,16 +238,54 @@ class MqttWireClient:
 
     def connect(self) -> None:
         """``realConnect`` — CONNECT → CONNACK; raises MqttConnectError on
-        a refusal return code. Idempotent when already connected."""
-        if self._connected:
-            return
+        a refusal return code. Idempotent when already connected.
+
+        Re-arms a client that was closed: after a link loss the client
+        keeps reconnecting on its own until :meth:`close`."""
+        with self._state_lock:
+            self._closing = False
+            self._stop.clear()
+        self._do_connect()
+
+    def _do_connect(self) -> None:
+        """One connect attempt, serialized with every other one (the
+        reconnect loop, ``is_real_connect`` and callers may race). Never
+        reopens a client that was closed.
+
+        The status callbacks run once the connect lock is released (and,
+        on success, once the reader is up): a callback may then wait for
+        an ack or start another connect without deadlocking."""
+        with self._connect_lock:
+            if self._connected or self._closing:
+                return
+            try:
+                connected = self._connect_once()
+            except Exception as e:
+                error = e
+            else:
+                error = None
+        if error is not None:
+            self._notify_connect_error(
+                str(error.code if isinstance(error, MqttConnectError) else -1),
+                str(error),
+            )
+            raise error
+        # close() may have run since the session went up: a closed client
+        # does not report a connection.
+        if connected and self._connected and not self._closing:
+            self._notify_connect_success()
+
+    def _connect_once(self) -> bool:
+        """CONNECT → CONNACK on a fresh socket, then start the reader and
+        pinger. Returns False when :meth:`close` ran during the handshake:
+        the new socket is closed instead of becoming a session nobody
+        owns."""
         self._last_connect_attempt = self._clock_ms()
-        self._closing = False
+        sock = None
         try:
             host = self.config.host or ""
             port = self.config.port
             sock = self._sock_factory(host, port, float(self.config.time_out))
-            self._sock = sock
 
             flags = 0x02  # cleanSession
             will_payload = b""
@@ -219,11 +305,15 @@ class MqttWireClient:
                 + bytes([0x04, flags])
                 + struct.pack(">H", int(self.config.keep_alive))
             )
-            self._send(self._packet(_CONNECT, vh + payload))
-            header = self._read_exact(1)[0]
+
+            def read(n: int) -> bytes:
+                return self._read_exact(n, sock)
+
+            sock.sendall(self._packet(_CONNECT, vh + payload))
+            header = read(1)[0]
             if header >> 4 != _CONNACK >> 4:
                 raise MqttConnectError(-1)
-            body = self._read_exact(_decode_remaining(self._read_exact))
+            body = read(_decode_remaining(read))
             rc = body[1]
             if rc != 0:
                 raise MqttConnectError(rc)
@@ -235,22 +325,39 @@ class MqttWireClient:
             settimeout = getattr(sock, "settimeout", None)
             if settimeout is not None:
                 settimeout(self.read_timeout)
-        except Exception as e:
-            self._notify_connect_error(
-                str(e.code if isinstance(e, MqttConnectError) else -1), str(e)
-            )
+        except Exception:
+            _close_socket(sock)
             raise
-        self._connected = True
-        self._notify_connect_success()
+        with self._state_lock:
+            if self._closing:
+                # close() ran during the handshake: drop this session.
+                _close_socket(sock, disconnect=self._packet(_DISCONNECT))
+                return False
+            # The reader and pinger of an earlier session exit when they
+            # see the generation move on, so a reconnect never runs two of
+            # each.
+            self._generation += 1
+            generation = self._generation
+            self._sock = sock
+            self._last_tx = time.monotonic()
+            self._connected_at = time.monotonic()
+            self._connected = True
         self._last_rx = time.monotonic()
         self._reader = threading.Thread(
-            target=self._reader_loop, name="pypopur-mqtt-rx", daemon=True
+            target=self._reader_loop,
+            args=(generation, sock),
+            name="pypopur-mqtt-rx",
+            daemon=True,
         )
         self._reader.start()
         self._pinger = threading.Thread(
-            target=self._ping_loop, name="pypopur-mqtt-ping", daemon=True
+            target=self._ping_loop,
+            args=(generation,),
+            name="pypopur-mqtt-ping",
+            daemon=True,
         )
         self._pinger.start()
+        return True
 
     def is_real_connect(self) -> bool:
         """``isRealConnect`` — flag plus the 120 s reconnect side effect."""
@@ -262,28 +369,61 @@ class MqttWireClient:
 
     def _try_reconnect(self) -> None:
         """``tryToConnect`` — best-effort reconnect; failures are logged,
-        not raised (Java swallows into the connect-lost log)."""
+        not raised (Java swallows into the connect-lost log). Never
+        reopens a client that was closed."""
         try:
-            self.connect()
-        except Exception:
-            log.exception("mqtt reconnect failed")
+            self._do_connect()
+        except Exception as err:
+            log.warning("mqtt reconnect failed: %s", err)
+
+    def _reconnect_loop(self, wait_first: bool = False) -> None:
+        """Reconnect after a link loss until connected or closed.
+
+        A single attempt is not enough: the link usually drops because the
+        network or the broker is away, and the next attempt fails too.
+        Nothing else retries (``is_real_connect`` only runs on a publish),
+        so the session would stay down for good. Retries back off from
+        ``reconnect_backoff[0]`` to ``reconnect_backoff[1]`` seconds.
+        ``wait_first`` waits the first delay before trying: a session the
+        broker drops right after accepting it is not hammered."""
+        delay, max_delay = self._reconnect_backoff
+        if wait_first and self._stop.wait(delay):
+            return
+        while not self._closing and not self._connected:
+            try:
+                self._do_connect()
+            except Exception as err:
+                log.warning("mqtt reconnect failed, retrying in %.1f s: %s", delay, err)
+            else:
+                if self._connected:
+                    log.info("mqtt reconnected")
+                return
+            if self._stop.wait(delay):
+                return
+            delay = min(delay * 2, max_delay)
 
     def close(self) -> None:
-        """``justClose``/``close`` — DISCONNECT then socket close."""
-        self._closing = True
-        self._connected = False
-        sock = self._sock
-        self._sock = None
+        """``justClose``/``close`` — DISCONNECT then socket close; also
+        stops a running reconnect loop and a connect in flight."""
+        with self._state_lock:
+            self._closing = True
+            self._stop.set()
+            self._connected = False
+            sock = self._sock
+            self._sock = None
         if sock is not None:
-            try:
-                with self._send_lock:
-                    sock.sendall(self._packet(_DISCONNECT))
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
+            # shutdown() wakes the reader blocked in recv(); a bare close()
+            # leaves it there until the read timeout. DISCONNECT needs the
+            # send lock so it does not interleave with another packet, but
+            # a send stuck on a stalled peer must not hold close() up:
+            # then skip DISCONNECT, and the shutdown also unblocks it.
+            if self._send_lock.acquire(timeout=CLOSE_SEND_WAIT_S):
+                try:
+                    _close_socket(sock, disconnect=self._packet(_DISCONNECT))
+                finally:
+                    self._send_lock.release()
+            else:
+                _close_socket(sock)
         # Fail everything in flight.
         pending, self._pending = self._pending, {}
         for _, resolve in pending.values():
@@ -419,18 +559,24 @@ class MqttWireClient:
 
     # -- reader / keepalive ---------------------------------------------
 
-    def _reader_loop(self) -> None:
+    def _current(self, generation: int) -> bool:
+        return self._generation == generation and self._connected and not self._closing
+
+    def _reader_loop(self, generation: int, sock: Any) -> None:
+        def read(n: int) -> bytes:
+            return self._read_exact(n, sock)
+
         try:
-            while self._connected and not self._closing:
-                header = self._read_exact(1)[0]
-                remaining = _decode_remaining(self._read_exact)
-                body = self._read_exact(remaining)
+            while self._current(generation):
+                header = read(1)[0]
+                remaining = _decode_remaining(read)
+                body = read(remaining)
                 self._last_rx = time.monotonic()
                 self._dispatch_packet(header, body)
         except (ConnectionError, OSError, ValueError):
             pass
         finally:
-            self._link_lost()
+            self._link_lost(generation, sock)
 
     def _dispatch_packet(self, header: int, body: bytes) -> None:
         ptype = header >> 4
@@ -472,30 +618,41 @@ class MqttWireClient:
         except Exception:
             log.exception("mqtt resolve")
 
-    def _ping_loop(self) -> None:
+    def _ping_loop(self, generation: int) -> None:
         interval = max(1.0, float(self.config.keep_alive) * 0.9)
-        while self._connected and not self._closing:
-            time.sleep(interval)
-            if not self._connected or self._closing:
+        while self._current(generation):
+            if self._stop.wait(interval) or not self._current(generation):
                 return
             try:
                 self._send(self._packet(_PINGREQ))
             except OSError:
                 return
 
-    def _link_lost(self) -> None:
-        was = self._connected
-        self._connected = False
-        if not was or self._closing:
+    def _link_lost(self, generation: int, sock: Any) -> None:
+        """The reader of session ``generation`` stopped reading ``sock``.
+
+        Only that session's own socket is closed: a newer session may
+        already own ``self._sock``."""
+        with self._state_lock:
+            current = generation == self._generation
+            was = current and self._connected
+            if current:
+                self._connected = False
+            closing = self._closing
+            # Take this session's in-flight requests while still holding
+            # the state lock: a newer session can only go up after this,
+            # so its requests land in the fresh map and are not failed.
+            pending: dict[int, tuple[int, Callable]] = {}
+            if was and not closing:
+                pending, self._pending = self._pending, {}
+        _close_socket(sock)
+        if not was or closing:
             return
-        pending, self._pending = self._pending, {}
         for _, resolve in pending.values():
             try:
                 resolve(False, None)
             except Exception:
                 pass
-        try:
-            self._sock.close()  # type: ignore[union-attr]
-        except Exception:
-            pass
-        self._try_reconnect()
+        flapped = time.monotonic() - self._connected_at < FLAP_WINDOW_S
+        log.info("mqtt link lost, reconnecting")
+        self._reconnect_loop(wait_first=flapped)
