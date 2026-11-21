@@ -391,18 +391,41 @@ class PopurMqttEvents:
         self.client.subscribe([SMART_MB_IN + dev_id], [qos], None)
 
     async def connect(self, dev_ids: list[str] | None = None) -> None:
-        """Open the TLS session and subscribe the device + user topics."""
+        """Open the TLS session and subscribe the device + user topics.
 
-        await asyncio.to_thread(self.client.connect)
+        The topics are SUBSCRIBEd from the connect-success hook
+        (:meth:`_resubscribe`), which first resets their state in the
+        per-tag :class:`MqttServerManager`. That manager is a process-wide
+        singleton: a previous session with the same tag (an earlier
+        instance, e.g. before a reload) may have left them marked
+        subscribed, while the broker's clean session holds none of them."""
+
+        if self.listener not in self.manager.message_listeners:
+            self.manager.message_listeners.append(self.listener)
         for dev_id in dev_ids or sorted(self.listener._local_keys):
             self._subscriptions[SMART_MB_IN + dev_id] = 1
         if self._user_topic:
             self._subscriptions[self._user_topic] = 1
-        if self._subscriptions:
+        if self.client.connected:
+            # Already up: no connect-success hook will run, so SUBSCRIBE
+            # the topics added by this call here. ``manager.subscribe``
+            # skips the ones already live.
             topics = list(self._subscriptions)
             await asyncio.to_thread(
-                self.client.subscribe, topics, [1] * len(topics), None
+                self.client.subscribe,
+                topics,
+                [self._subscriptions[t] for t in topics],
+                None,
             )
+            return
+        await asyncio.to_thread(self.client.connect)
 
     async def close(self) -> None:
+        """Close the session and detach from the shared per-tag manager,
+        so a later instance with the same tag starts clean."""
+
         await asyncio.to_thread(self.client.close)
+        if self.listener in self.manager.message_listeners:
+            self.manager.message_listeners.remove(self.listener)
+        for topic in self._subscriptions:
+            self.manager.mark_unsubscribe(topic)
