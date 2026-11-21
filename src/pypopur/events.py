@@ -194,9 +194,7 @@ class DeviceEventListener:
         data = obj if isinstance(obj, Mapping) else {}
         inner = data.get("data")
         payload = inner if isinstance(inner, Mapping) else data
-        dev_id = str(
-            payload.get("devId") or payload.get("gwId") or _dev_id_from_topic(topic)
-        )
+        dev_id = str(payload.get("devId") or payload.get("gwId") or _dev_id_from_topic(topic))
         event = DeviceEvent(
             dev_id=dev_id,
             protocol=protocol,

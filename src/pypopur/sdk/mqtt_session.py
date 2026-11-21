@@ -344,20 +344,20 @@ class MqttServerManager:
         iteration order."""
 
         if topic.startswith(TYLINK_PREFIX):
-            for listener in self.message_listeners:
+            for listener in list(self.message_listeners):
                 try:
                     obj = parse_object(payload.decode())
                     listener.on_mqtt_dp_received_success(topic, -1, obj)
                 except Exception as e:
                     listener.on_mqtt_dp_received_error(topic, "ParseMqttMessageError", str(e))
         elif topic.startswith(YU_MB_IN_PREFIX):
-            for listener in self.message_listeners:
+            for listener in list(self.message_listeners):
                 try:
                     listener.on_mqtt_dp_received_success(topic, -1, {"data": payload})
                 except Exception as e:
                     listener.on_mqtt_dp_received_error(topic, "ParseMqttMessageError", str(e))
         elif not topic.startswith(MM_I_PREFIX):
-            for listener in self.message_listeners:
+            for listener in list(self.message_listeners):
                 try:
                     results = dispatch_inbound_message(
                         topic,

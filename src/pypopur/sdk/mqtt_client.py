@@ -67,6 +67,11 @@ RECONNECT_BACKOFF_S = (5.0, 300.0)
 FLAP_WINDOW_S = 10.0
 
 
+# How long close() waits for a send in progress before it skips the
+# DISCONNECT packet and shuts the socket down anyway.
+CLOSE_SEND_WAIT_S = 1.0
+
+
 def _close_socket(sock: Any, disconnect: bytes | None = None) -> None:
     """Best-effort DISCONNECT, shutdown (wakes a reader blocked in
     ``recv``) and close."""
@@ -247,14 +252,27 @@ class MqttWireClient:
         reconnect loop, ``is_real_connect`` and callers may race). Never
         reopens a client that was closed.
 
-        The connect-success callbacks run once the reader is up and the
-        connect lock is released: a callback may then wait for an ack or
-        start another connect without deadlocking."""
+        The status callbacks run once the connect lock is released (and,
+        on success, once the reader is up): a callback may then wait for
+        an ack or start another connect without deadlocking."""
         with self._connect_lock:
             if self._connected or self._closing:
                 return
-            connected = self._connect_once()
-        if connected:
+            try:
+                connected = self._connect_once()
+            except Exception as e:
+                error = e
+            else:
+                error = None
+        if error is not None:
+            self._notify_connect_error(
+                str(error.code if isinstance(error, MqttConnectError) else -1),
+                str(error),
+            )
+            raise error
+        # close() may have run since the session went up: a closed client
+        # does not report a connection.
+        if connected and self._connected and not self._closing:
             self._notify_connect_success()
 
     def _connect_once(self) -> bool:
@@ -307,11 +325,8 @@ class MqttWireClient:
             settimeout = getattr(sock, "settimeout", None)
             if settimeout is not None:
                 settimeout(self.read_timeout)
-        except Exception as e:
+        except Exception:
             _close_socket(sock)
-            self._notify_connect_error(
-                str(e.code if isinstance(e, MqttConnectError) else -1), str(e)
-            )
             raise
         with self._state_lock:
             if self._closing:
@@ -397,10 +412,18 @@ class MqttWireClient:
             sock = self._sock
             self._sock = None
         if sock is not None:
-            with self._send_lock:
-                # shutdown() wakes the reader blocked in recv(); a bare
-                # close() leaves it there until the read timeout.
-                _close_socket(sock, disconnect=self._packet(_DISCONNECT))
+            # shutdown() wakes the reader blocked in recv(); a bare close()
+            # leaves it there until the read timeout. DISCONNECT needs the
+            # send lock so it does not interleave with another packet, but
+            # a send stuck on a stalled peer must not hold close() up:
+            # then skip DISCONNECT, and the shutdown also unblocks it.
+            if self._send_lock.acquire(timeout=CLOSE_SEND_WAIT_S):
+                try:
+                    _close_socket(sock, disconnect=self._packet(_DISCONNECT))
+                finally:
+                    self._send_lock.release()
+            else:
+                _close_socket(sock)
         # Fail everything in flight.
         pending, self._pending = self._pending, {}
         for _, resolve in pending.values():
@@ -616,10 +639,15 @@ class MqttWireClient:
             if current:
                 self._connected = False
             closing = self._closing
+            # Take this session's in-flight requests while still holding
+            # the state lock: a newer session can only go up after this,
+            # so its requests land in the fresh map and are not failed.
+            pending: dict[int, tuple[int, Callable]] = {}
+            if was and not closing:
+                pending, self._pending = self._pending, {}
         _close_socket(sock)
         if not was or closing:
             return
-        pending, self._pending = self._pending, {}
         for _, resolve in pending.values():
             try:
                 resolve(False, None)
