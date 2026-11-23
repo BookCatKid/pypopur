@@ -12,6 +12,7 @@ import urllib.error
 import uuid
 import zipfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -498,11 +499,11 @@ class CryptoTests(unittest.TestCase):
                 MobileAppProfile.from_popur_app2_apk(apk_path)
 
         certificate = b"synthetic DER certificate bytes"
-        with tempfile.NamedTemporaryFile() as apk_file:
-            apk_file.write(_synthetic_v2_signed_apk(certificate))
-            apk_file.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            apk_path = Path(directory) / "signed.apk"
+            apk_path.write_bytes(_synthetic_v2_signed_apk(certificate))
             self.assertEqual(
-                extract_apk_signing_certificate_sha256(apk_file.name),
+                extract_apk_signing_certificate_sha256(apk_path),
                 hashlib.sha256(certificate).hexdigest(),
             )
 
@@ -511,11 +512,11 @@ class CryptoTests(unittest.TestCase):
             extract_thing_security_components("client", b"not-a-bitmap")
         with self.assertRaisesRegex(ValueError, "client_id"):
             extract_thing_security_components("", _synthetic_security_bitmap("client", b"x"))
-        with tempfile.NamedTemporaryFile() as file:
-            file.write(b"not-an-apk")
-            file.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            apk_path = Path(directory) / "invalid.apk"
+            apk_path.write_bytes(b"not-an-apk")
             with self.assertRaisesRegex(ValueError, "signing block|ZIP end"):
-                extract_apk_signing_certificate_sha256(file.name)
+                extract_apk_signing_certificate_sha256(apk_path)
 
     def test_profile_derivation_and_secret_redaction(self) -> None:
         certificate = "11" * 32
