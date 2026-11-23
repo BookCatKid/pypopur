@@ -308,13 +308,13 @@ def test_is_real_connect_reconnect_side_effect() -> None:
     broker = FakeBroker()
     _manager, client = _client(broker)
     attempts: list[int] = []
-    orig = client.connect
+    orig = client._do_connect
 
     def counted():
         attempts.append(1)
         return orig()
 
-    client.connect = counted  # type: ignore[assignment]
+    client._do_connect = counted  # type: ignore[method-assign]
     try:
         client.connect()
         # connected → no reconnect attempt
@@ -326,6 +326,295 @@ def test_is_real_connect_reconnect_side_effect() -> None:
         client.is_real_connect()
         _wait_for(lambda: client.connected)
         assert len(attempts) == 2
+    finally:
+        client.close()
+        broker.stop()
+
+
+def _flaky_client(broker: FakeBroker, failures: int) -> tuple[MqttWireClient, list[int]]:
+    """A client whose socket factory refuses ``failures`` connects after
+    the first one, like a network that is away for a while."""
+
+    manager = MqttServerManager("t-flaky")
+    config = MqttConfigBean(
+        client_id="pkg_mb_dev-tag_tag",
+        host="127.0.0.1",
+        port=broker.port,
+        keep_alive=60,
+    )
+
+    class Creds:
+        def username(self) -> str:
+            return "u"
+
+        def password(self) -> str:
+            return "p"
+
+        def user_topic(self) -> str:
+            return "pid/mb/uid"
+
+    calls: list[int] = []
+
+    def factory(h, p, t):
+        calls.append(1)
+        if 1 < len(calls) <= 1 + failures:
+            raise OSError("network unreachable")
+        return socket.create_connection((h, p), timeout=t)
+
+    client = MqttWireClient(
+        manager,
+        config,
+        Creds(),
+        sock_factory=factory,
+        reconnect_backoff=(0.05, 0.2),
+    )
+    return client, calls
+
+
+def _drop_link(broker: FakeBroker) -> None:
+    # shutdown() sends the FIN; a bare close() under a blocked recv() does not.
+    broker.conn.shutdown(socket.SHUT_RDWR)
+    broker.conn.close()
+
+
+def test_link_loss_keeps_retrying_until_reconnected() -> None:
+    """Regression: a link loss used to try one reconnect only; when that
+    failed (network still down) the session stayed dead for good."""
+
+    broker = FakeBroker()
+    client, calls = _flaky_client(broker, failures=3)
+    try:
+        client.connect()
+        _wait_for(lambda: broker.connect_count == 1)
+        _drop_link(broker)
+        # _connected flips before the new reader starts: wait for both.
+        _wait_for(
+            lambda: (
+                client.connected
+                and broker.connect_count == 2
+                and client._reader is not None
+                and client._reader.is_alive()
+            )
+        )
+        assert len(calls) == 5  # first connect, 3 refused, then back
+    finally:
+        client.close()
+        broker.stop()
+
+
+def test_close_stops_reconnect_loop() -> None:
+    broker = FakeBroker()
+    client, calls = _flaky_client(broker, failures=10_000)
+    try:
+        client.connect()
+        _wait_for(lambda: broker.connect_count == 1)
+        _drop_link(broker)
+        _wait_for(lambda: len(calls) >= 3)
+        client.close()
+        time.sleep(0.3)
+        settled = len(calls)
+        time.sleep(0.5)
+        assert len(calls) == settled
+        assert not client.connected
+    finally:
+        broker.stop()
+
+
+def test_close_during_connect_drops_the_new_session() -> None:
+    """close() while a (re)connect is in its handshake must not leave a
+    session behind: no connect callback, socket closed, not connected."""
+
+    broker = FakeBroker()
+    manager = MqttServerManager("t-close-race")
+    config = MqttConfigBean(
+        client_id="pkg_mb_dev-tag_tag",
+        host="127.0.0.1",
+        port=broker.port,
+        keep_alive=60,
+    )
+
+    class Creds:
+        def username(self) -> str:
+            return "u"
+
+        def password(self) -> str:
+            return "p"
+
+        def user_topic(self) -> str:
+            return "pid/mb/uid"
+
+    entered = threading.Event()
+    release = threading.Event()
+    socks: list[socket.socket] = []
+
+    def factory(h, p, t):
+        entered.set()
+        release.wait(5)
+        sock = socket.create_connection((h, p), timeout=t)
+        socks.append(sock)
+        return sock
+
+    client = MqttWireClient(manager, config, Creds(), sock_factory=factory)
+    connects: list[int] = []
+
+    class Status:
+        def on_connect_success(self) -> None:
+            connects.append(1)
+
+        def on_connect_error(self, code: str, error: str) -> None:
+            pass
+
+    client.register_mqtt_callback(Status())
+    worker = threading.Thread(target=client.connect, daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(5)
+        client.close()  # lands during the handshake
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert not client.connected
+        assert connects == []
+        assert client._sock is None
+        assert socks and socks[0].fileno() == -1  # closed
+    finally:
+        release.set()
+        client.close()
+        broker.stop()
+
+
+def test_close_wakes_the_reader() -> None:
+    broker = FakeBroker()
+    _manager, client = _client(broker, tag="t-close-wake")
+    try:
+        client.connect()
+        reader = client._reader
+        assert reader is not None and reader.is_alive()
+        client.close()
+        reader.join(2)
+        assert not reader.is_alive()
+    finally:
+        broker.stop()
+
+
+def test_flapping_session_waits_before_reconnecting() -> None:
+    """A session the broker drops right after CONNACK is retried after
+    one backoff step, not at once."""
+
+    broker = FakeBroker()
+    client, _calls = _flaky_client(broker, failures=0)
+    client._reconnect_backoff = (0.5, 1.0)
+    try:
+        client.connect()
+        _wait_for(lambda: broker.connect_count == 1)
+        dropped = time.monotonic()
+        _drop_link(broker)
+        _wait_for(lambda: broker.connect_count == 2)
+        assert time.monotonic() - dropped >= 0.45
+    finally:
+        client.close()
+        broker.stop()
+
+
+def test_connect_error_callback_may_connect_again() -> None:
+    """The error callback runs outside the connect lock: retrying from it
+    must not deadlock."""
+
+    broker = FakeBroker()
+    client, calls = _flaky_client(broker, failures=0)
+    # Refuse the very first connect only.
+    factory = client._sock_factory
+
+    def refuse_first(h, p, t):
+        if not calls:
+            calls.append(0)
+            raise OSError("network unreachable")
+        return factory(h, p, t)
+
+    client._sock_factory = refuse_first
+    retried: list[int] = []
+
+    class Status:
+        def on_connect_success(self) -> None:
+            pass
+
+        def on_connect_error(self, code: str, error: str) -> None:
+            if not retried:
+                retried.append(1)
+                client.connect()
+
+    client.register_mqtt_callback(Status())
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            client.connect()
+        except OSError as err:
+            errors.append(err)
+
+    worker = threading.Thread(target=run, daemon=True)
+    try:
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert retried == [1]
+        assert len(errors) == 1  # the outer attempt still reports its error
+        assert client.connected
+    finally:
+        client.close()
+        broker.stop()
+
+
+def test_close_does_not_wait_for_a_stuck_send() -> None:
+    broker = FakeBroker()
+    _manager, client = _client(broker, tag="t-close-stuck")
+    try:
+        client.connect()
+        reader = client._reader
+        client._send_lock.acquire()  # a send blocked on a stalled peer
+        try:
+            started = time.monotonic()
+            client.close()
+            assert time.monotonic() - started < 3
+        finally:
+            client._send_lock.release()
+        assert reader is not None
+        reader.join(2)
+        assert not reader.is_alive()
+    finally:
+        broker.stop()
+
+
+def test_link_loss_keeps_requests_of_a_newer_session(monkeypatch) -> None:
+    """A session that comes up while the old reader is still cleaning up
+    keeps its in-flight requests."""
+
+    from pypopur.sdk import mqtt_client
+
+    broker = FakeBroker()
+    client, _calls = _flaky_client(broker, failures=0)
+    results: list[bool] = []
+    real_close = mqtt_client._close_socket
+    old_sock: list[object] = []
+
+    def close_and_race(sock, disconnect=None):
+        real_close(sock, disconnect)
+        if old_sock and sock is old_sock[0]:
+            old_sock.clear()
+            # A connect() from another caller wins the race here.
+            client._do_connect()
+            client._pending[999] = (0x90, lambda ok, _d: results.append(ok))
+
+    monkeypatch.setattr(mqtt_client, "_close_socket", close_and_race)
+    try:
+        client.connect()
+        _wait_for(lambda: broker.connect_count == 1)
+        old_sock.append(client._sock)
+        _drop_link(broker)
+        _wait_for(lambda: broker.connect_count == 2 and not old_sock)
+        time.sleep(0.2)
+        assert results == []
+        assert 999 in client._pending
     finally:
         client.close()
         broker.stop()
