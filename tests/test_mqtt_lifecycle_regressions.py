@@ -58,14 +58,14 @@ def test_superseded_connect_does_not_emit_success_callback() -> None:
     notify = client._notify_connect_success
     calls = 0
 
-    def delayed_notify() -> None:
+    def delayed_notify(*args: int) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             first_notification.set()
             if not release_first_notification.wait(timeout=5):
                 raise TimeoutError("connection callback was not released")
-        notify()
+        notify(*args)
 
     client._notify_connect_success = delayed_notify
 
