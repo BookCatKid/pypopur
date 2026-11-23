@@ -71,6 +71,11 @@ FLAP_WINDOW_S = 10.0
 # DISCONNECT packet and shuts the socket down anyway.
 CLOSE_SEND_WAIT_S = 1.0
 
+# A short socket read timeout lets a closed reader exit even on systems
+# where shutdown() does not reliably interrupt an already-blocked recv().
+# The actual idle deadline is still the full read_timeout.
+READER_POLL_INTERVAL_S = 0.1
+
 
 def _close_socket(sock: Any, disconnect: bytes | None = None) -> None:
     """Best-effort DISCONNECT, shutdown (wakes a reader blocked in
@@ -178,6 +183,7 @@ class MqttWireClient:
         self._closing = False
         self._last_connect_attempt = 0
         self._packet_id = 0
+        self._packet_id_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._reader: threading.Thread | None = None
         self._pinger: threading.Thread | None = None
@@ -208,19 +214,34 @@ class MqttWireClient:
         return max(float(self.config.time_out), float(self.config.keep_alive) * 1.5)
 
     def _next_packet_id(self) -> int:
-        self._packet_id = (self._packet_id + 1) & 0xFFFF
-        if self._packet_id == 0:
-            self._packet_id = 1
-        return self._packet_id
+        with self._packet_id_lock:
+            self._packet_id = (self._packet_id + 1) & 0xFFFF
+            if self._packet_id == 0:
+                self._packet_id = 1
+            return self._packet_id
 
-    def _read_exact(self, n: int, sock: Any = None) -> bytes:
+    def _read_exact(
+        self, n: int, sock: Any = None, *, generation: int | None = None
+    ) -> bytes:
         sock = sock if sock is not None else self._sock
         chunks = bytearray()
+        last_byte_at = time.monotonic()
         while len(chunks) < n:
-            part = sock.recv(n - len(chunks))  # type: ignore[union-attr]
+            if generation is not None and not self._current(generation):
+                raise ConnectionError("mqtt session closed")
+            try:
+                part = sock.recv(n - len(chunks))  # type: ignore[union-attr]
+            except TimeoutError:
+                # The handshake retains its ordinary timeout. Once connected,
+                # keep checking for close/replacement without treating a quiet
+                # broker as dead before the full keepalive read deadline.
+                if generation is None or time.monotonic() - last_byte_at >= self.read_timeout:
+                    raise
+                continue
             if not part:
                 raise ConnectionError("socket closed")
             chunks.extend(part)
+            last_byte_at = time.monotonic()
         return bytes(chunks)
 
     def _send(self, packet: bytes) -> None:
@@ -233,6 +254,27 @@ class MqttWireClient:
 
     def _packet(self, header: int, body: bytes = b"") -> bytes:
         return bytes([header]) + _encode_remaining(len(body)) + body
+
+    def _register_pending(
+        self, pid: int, expected: int, resolve: Callable[[bool, bytes | None], None]
+    ) -> bool:
+        """Only register requests while the current session is still live.
+
+        Both close() and link-loss cleanup drain this map under _state_lock.
+        A request racing with that drain must not enter an already-dead
+        session after the old pending map has been replaced.
+        """
+        with self._state_lock:
+            if not self._connected or self._closing:
+                return False
+            self._pending[pid] = (expected, resolve)
+            return True
+
+    def _take_pending(
+        self, pid: int
+    ) -> tuple[int, Callable[[bool, bytes | None], None]] | None:
+        with self._state_lock:
+            return self._pending.pop(pid, None)
 
     # -- lifecycle ------------------------------------------------------
 
@@ -264,16 +306,17 @@ class MqttWireClient:
                 error = e
             else:
                 error = None
+                generation = self._generation if connected else None
         if error is not None:
             self._notify_connect_error(
                 str(error.code if isinstance(error, MqttConnectError) else -1),
                 str(error),
             )
             raise error
-        # close() may have run since the session went up: a closed client
-        # does not report a connection.
-        if connected and self._connected and not self._closing:
-            self._notify_connect_success()
+        # A different session may have replaced this one after the connect
+        # lock was released. Report only the generation that actually connected.
+        if connected and generation is not None:
+            self._notify_connect_success(generation)
 
     def _connect_once(self) -> bool:
         """CONNECT → CONNACK on a fresh socket, then start the reader and
@@ -322,9 +365,11 @@ class MqttWireClient:
             # the handshake timeout there drops the link after every quiet
             # ``time_out`` window (pings only go out at 0.9×keepAlive).
             # Allow one missed PINGRESP before declaring the link dead.
+            # Poll for close/replacement frequently, while _read_exact()
+            # preserves the full idle deadline across poll timeouts.
             settimeout = getattr(sock, "settimeout", None)
             if settimeout is not None:
-                settimeout(self.read_timeout)
+                settimeout(min(READER_POLL_INTERVAL_S, self.read_timeout))
         except Exception:
             _close_socket(sock)
             raise
@@ -411,6 +456,10 @@ class MqttWireClient:
             self._connected = False
             sock = self._sock
             self._sock = None
+            # Atomically detach this session's outstanding requests. A caller
+            # may re-arm the client while socket shutdown is still running;
+            # its new requests must not be failed by this old close().
+            pending, self._pending = self._pending, {}
         if sock is not None:
             # shutdown() wakes the reader blocked in recv(); a bare close()
             # leaves it there until the read timeout. DISCONNECT needs the
@@ -424,8 +473,6 @@ class MqttWireClient:
                     self._send_lock.release()
             else:
                 _close_socket(sock)
-        # Fail everything in flight.
-        pending, self._pending = self._pending, {}
         for _, resolve in pending.values():
             try:
                 resolve(False, None)
@@ -444,8 +491,10 @@ class MqttWireClient:
         if cb not in self._status_callbacks:
             self._status_callbacks.append(cb)
 
-    def _notify_connect_success(self) -> None:
+    def _notify_connect_success(self, generation: int) -> None:
         for cb in list(self._status_callbacks):
+            if not self._current(generation):
+                return
             try:
                 cb.on_connect_success()
             except Exception:
@@ -492,8 +541,16 @@ class MqttWireClient:
             elif cb is not None:
                 cb.on_error("6000", "subscribe failed")
 
-        self._pending[pid] = (_SUBACK, resolve)
-        self._send(self._packet(_SUBSCRIBE, body))
+        if not self._register_pending(pid, _SUBACK, resolve):
+            resolve(False, None)
+            return
+        try:
+            self._send(self._packet(_SUBSCRIBE, body))
+        except OSError:
+            # The reader may already have drained this request on link loss.
+            # Resolve only if this send still owns the pending entry.
+            if self._take_pending(pid) is not None:
+                resolve(False, None)
 
     def unsubscribe(self, topics: list[str], cb: Any = None) -> None:
         if not self._connected:
@@ -513,8 +570,14 @@ class MqttWireClient:
             elif cb is not None:
                 cb.on_error("6000", "unsubscribe failed")
 
-        self._pending[pid] = (_UNSUBACK, resolve)
-        self._send(self._packet(_UNSUBSCRIBE, body))
+        if not self._register_pending(pid, _UNSUBACK, resolve):
+            resolve(False, None)
+            return
+        try:
+            self._send(self._packet(_UNSUBSCRIBE, body))
+        except OSError:
+            if self._take_pending(pid) is not None:
+                resolve(False, None)
 
     def publish(
         self,
@@ -542,20 +605,26 @@ class MqttWireClient:
                 if cb is not None:
                     cb.on_success() if ok else cb.on_error("6000", "publish failed")
 
-            self._pending[pid] = (_PUBACK, resolve)
+            if not self._register_pending(pid, _PUBACK, resolve):
+                resolve(False, None)
+                return
         elif qos == 2:
 
             def resolve(ok: bool, data: bytes | None) -> None:
                 if cb is not None:
                     cb.on_success() if ok else cb.on_error("6000", "publish failed")
 
-            self._pending[pid] = (_PUBREC, resolve)
+            if not self._register_pending(pid, _PUBREC, resolve):
+                resolve(False, None)
+                return
         try:
             self._send(self._packet(header, body))
         except OSError:
-            self._pending.pop(pid, None)
-            if cb is not None:
-                cb.on_error("6000", "publish failed")
+            if not qos:
+                if cb is not None:
+                    cb.on_error("6000", "publish failed")
+            elif self._take_pending(pid) is not None:
+                resolve(False, None)
 
     # -- reader / keepalive ---------------------------------------------
 
@@ -564,7 +633,7 @@ class MqttWireClient:
 
     def _reader_loop(self, generation: int, sock: Any) -> None:
         def read(n: int) -> bytes:
-            return self._read_exact(n, sock)
+            return self._read_exact(n, sock, generation=generation)
 
         try:
             while self._current(generation):
@@ -601,14 +670,17 @@ class MqttWireClient:
             return
         if ptype == _PUBREC >> 4:
             pid = struct.unpack(">H", body[:2])[0]
+            with self._state_lock:
+                pending = self._pending.pop(pid, None)
+                if pending is not None:
+                    self._pending[pid] = (_PUBCOMP, pending[1])
             self._send(self._packet(_PUBREL | 0x02, struct.pack(">H", pid)))
-            self._pending[pid] = (_PUBCOMP, self._pending.pop(pid, (0, lambda *_: None))[1])
             return
         if ptype == _PINGRESP >> 4:
             return
         # Ack types: CONNACK, PUBACK, PUBCOMP, SUBACK, UNSUBACK
         pid = struct.unpack(">H", body[:2])[0] if len(body) >= 2 else -1
-        pending = self._pending.pop(pid, None)
+        pending = self._take_pending(pid)
         if pending is None:
             return
         expected, resolve = pending
