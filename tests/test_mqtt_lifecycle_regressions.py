@@ -84,12 +84,18 @@ def test_superseded_connect_does_not_emit_success_callback() -> None:
         # A different connection now owns the client. Only its notification
         # is valid; the paused first connection must not notify again.
         client.connect()
+        assert notifications == [True], (
+            "the replacement session must notify before releasing the old callback"
+        )
+
         release_first_notification.set()
         worker.join(timeout=5)
 
         assert not worker.is_alive()
         assert not worker_errors
-        assert notifications == [True]
+        assert notifications == [True], (
+            "the superseded session must not emit another success notification"
+        )
     finally:
         release_first_notification.set()
         client.close()
@@ -102,6 +108,7 @@ def test_link_loss_drains_requests_registered_during_shutdown() -> None:
     _, client = _client(broker, tag="t-pending-disconnect")
     at_packet_id = threading.Event()
     resume_request = threading.Event()
+    packet_id_returned = threading.Event()
     errors: list[Exception] = []
 
     try:
@@ -118,18 +125,20 @@ def test_link_loss_drains_requests_registered_during_shutdown() -> None:
 
         def paused_packet_id() -> int:
             at_packet_id.set()
-            if not resume_request.wait(timeout=5):
+            if not resume_request.wait(timeout=10):
                 raise TimeoutError("pending request was not released")
-            return real_next_packet_id()
+            packet_id = real_next_packet_id()
+            packet_id_returned.set()
+            return packet_id
 
         client._next_packet_id = paused_packet_id
 
         def subscribe() -> None:
             try:
                 client.subscribe(["smart/mb/in/dev1"], [1])
-            except (OSError, ConnectionError, AttributeError) as error:
-                # A racing disconnect may make the send fail. What matters
-                # is that the request is not left permanently pending.
+            except Exception as error:  # noqa: BLE001 — inspect all worker failures
+                # A racing disconnect can legitimately fail a send, but an
+                # unexpected exception must never silently pass the test.
                 errors.append(error)
 
         worker = threading.Thread(target=subscribe, daemon=True)
@@ -149,7 +158,8 @@ def test_link_loss_drains_requests_registered_during_shutdown() -> None:
         resume_request.set()
         worker.join(timeout=5)
         assert not worker.is_alive()
-
+        assert packet_id_returned.is_set(), "the request never passed the paused registration point"
+        assert all(isinstance(error, (OSError, ConnectionError)) for error in errors), errors
         assert not client._pending, "a request survived the disconnected session"
     finally:
         resume_request.set()
