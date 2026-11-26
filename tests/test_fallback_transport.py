@@ -79,14 +79,18 @@ class FallbackTransportTests(unittest.TestCase):
         self.assertEqual(fallback.writes, [{112: False}])
         self.assertEqual(t.active, "fallback")
 
-    def test_on_fallback_callback_fires(self) -> None:
-        errors: list[Exception] = []
+    def test_on_fallback_callback_fires_after_primary_closes(self) -> None:
+        primary = _StubTransport(fail=True)
+        callbacks: list[tuple[int, Exception]] = []
         t = FallbackTransport(
-            _StubTransport(fail=True), _StubTransport(), on_fallback=errors.append
+            primary,
+            _StubTransport(),
+            on_fallback=lambda error: callbacks.append((primary.closed, error)),
         )
         asyncio.run(t.read_dps())
-        self.assertEqual(len(errors), 1)
-        self.assertIs(t.last_error, errors[0])
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0][0], 1)
+        self.assertIs(callbacks[0][1], t.last_error)
 
     def test_read_fills_missing_dps_from_fallback(self) -> None:
         """The LAN reply omits settings DPs; requested-but-missing ids must

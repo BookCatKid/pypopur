@@ -125,12 +125,12 @@ class FallbackTransport(PopurTransport):
     async def _mark_primary_dead(self, err: Exception) -> None:
         self.last_error = err
         self._primary_retry_at = time.monotonic() + self._backoff
+        try:
+            await self.primary.close()
+        except Exception:
+            pass
         if self._on_fallback is not None:
             try:
                 self._on_fallback(err)
             except Exception:
                 pass
-        try:
-            await self.primary.close()
-        except Exception:
-            pass
