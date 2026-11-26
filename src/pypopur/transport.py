@@ -43,6 +43,7 @@ class FallbackTransport(PopurTransport):
     ``fallback``, and the primary is skipped for ``backoff`` seconds so a
     dead LAN doesn't stall every call. ``active`` reports which channel
     served the last operation: ``"primary"``, ``"fallback"`` or ``None``.
+    ``on_fallback`` reports a primary failure, not guaranteed cleanup success.
     """
 
     def __init__(
@@ -123,12 +124,12 @@ class FallbackTransport(PopurTransport):
         self._primary_retry_at = 0.0
 
     async def _mark_primary_dead(self, err: Exception) -> None:
-        self.last_error = err
         self._primary_retry_at = time.monotonic() + self._backoff
         try:
             await self.primary.close()
         except Exception:
             pass
+        self.last_error = err
         if self._on_fallback is not None:
             try:
                 self._on_fallback(err)
