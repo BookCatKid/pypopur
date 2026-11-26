@@ -79,14 +79,97 @@ class FallbackTransportTests(unittest.TestCase):
         self.assertEqual(fallback.writes, [{112: False}])
         self.assertEqual(t.active, "fallback")
 
-    def test_on_fallback_callback_fires(self) -> None:
-        errors: list[Exception] = []
+    def test_on_fallback_callback_fires_after_primary_closes(self) -> None:
+        primary = _StubTransport(fail=True)
+        callbacks: list[tuple[int, Exception]] = []
         t = FallbackTransport(
-            _StubTransport(fail=True), _StubTransport(), on_fallback=errors.append
+            primary,
+            _StubTransport(),
+            on_fallback=lambda error: callbacks.append((primary.closed, error)),
         )
         asyncio.run(t.read_dps())
-        self.assertEqual(len(errors), 1)
-        self.assertIs(t.last_error, errors[0])
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0][0], 1)
+        self.assertIs(callbacks[0][1], t.last_error)
+
+    def test_close_error_still_falls_back(self) -> None:
+        class Primary(_StubTransport):
+            async def close(self) -> None:
+                raise OSError("shutdown failed")
+
+        primary = Primary(fail=True)
+        fallback = _StubTransport()
+        errors: list[Exception] = []
+        transport = FallbackTransport(primary, fallback, on_fallback=errors.append)
+        asyncio.run(transport.read_dps())
+        self.assertEqual(fallback.reads, 1)
+        self.assertEqual(errors, [transport.last_error])
+
+    def test_cancelled_close_does_not_notify_fallback(self) -> None:
+        async def run() -> None:
+            close_started = asyncio.Event()
+
+            class Primary(_StubTransport):
+                async def close(self) -> None:
+                    close_started.set()
+                    await asyncio.Event().wait()
+
+            errors: list[Exception] = []
+            transport = FallbackTransport(
+                Primary(fail=True), _StubTransport(), on_fallback=errors.append
+            )
+            task = asyncio.create_task(transport.read_dps())
+            await close_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(errors, [])
+
+        asyncio.run(run())
+
+    def test_concurrent_fallback_callbacks_match_last_error(self) -> None:
+        async def run() -> None:
+            reads_started = asyncio.Event()
+            first_failure = asyncio.Event()
+            second_failure = asyncio.Event()
+            first_close_started = asyncio.Event()
+            release_first_close = asyncio.Event()
+
+            class Primary(_StubTransport):
+                async def read_dps(self, ids=None):
+                    self.reads += 1
+                    if self.reads == 2:
+                        reads_started.set()
+                    await (first_failure if self.reads == 1 else second_failure).wait()
+                    raise OSError("down")
+
+                async def close(self) -> None:
+                    self.closed += 1
+                    if self.closed == 1:
+                        first_close_started.set()
+                        await release_first_close.wait()
+
+            primary = Primary()
+            notifications: list[tuple[Exception, Exception | None]] = []
+            transport = FallbackTransport(
+                primary,
+                _StubTransport(),
+                on_fallback=lambda err: notifications.append((err, transport.last_error)),
+            )
+            first = asyncio.create_task(transport.read_dps())
+            second = asyncio.create_task(transport.read_dps())
+            await reads_started.wait()
+            first_failure.set()
+            await first_close_started.wait()
+            second_failure.set()
+            await second
+            release_first_close.set()
+            await first
+            self.assertEqual(len(notifications), 2)
+            for error, last_error in notifications:
+                self.assertIs(error, last_error)
+
+        asyncio.run(run())
 
     def test_read_fills_missing_dps_from_fallback(self) -> None:
         """The LAN reply omits settings DPs; requested-but-missing ids must
